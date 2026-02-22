@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -54,6 +55,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--interval-seconds", type=int, default=120)
+    parser.add_argument(
+        "--interval-jitter-seconds",
+        type=int,
+        default=20,
+        help="Random jitter (+/- seconds) applied to interval sleeps",
+    )
     parser.add_argument("--max-actions", type=int, default=3)
     parser.add_argument("--post-cooldown-minutes", type=int, default=30)
     parser.add_argument("--allow-insecure-tls", action="store_true")
@@ -1570,7 +1577,14 @@ def main() -> None:
             print(json.dumps(payload, indent=2))
             if args.once:
                 break
-            time.sleep(max(15, args.interval_seconds))
+            base_interval = max(15, args.interval_seconds)
+            jitter = max(0, int(args.interval_jitter_seconds))
+            if jitter > 0:
+                delta = random.uniform(-jitter, jitter)
+                sleep_for = max(15, int(round(base_interval + delta)))
+            else:
+                sleep_for = base_interval
+            time.sleep(sleep_for)
     finally:
         agent.close()
         llm.close()
