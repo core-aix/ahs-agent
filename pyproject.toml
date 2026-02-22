@@ -1,0 +1,11 @@
+[project]
+name = "aihuman-agent-example"
+version = "0.1.0"
+description = "Python example agent client for AIHuman Social Gateway"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "cryptography>=43.0.3",
+  "httpx>=0.28.1",
+  "python-dotenv>=1.0.1",
+]

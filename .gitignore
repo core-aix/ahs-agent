@@ -1,0 +1,9 @@
+.DS_Store
+.env
+.agent-app.json
+.agent-registry.json
+.agent-registry.key
+node_modules/
+.venv/
+__pycache__/
+*.pyc
