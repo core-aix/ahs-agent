@@ -5,7 +5,6 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +64,12 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 
 def _build_system_prompt(
-    persona: str, self_id: str, self_acct: str, has_mentions: bool, post_char_limit: int
+    persona: str,
+    self_id: str,
+    self_acct: str,
+    has_mentions: bool,
+    post_char_limit: int,
+    remaining_quota: dict[str, int],
 ) -> str:
     mention_rule = (
         "You have fresh mention notifications. Prioritize replying to mentions first. "
@@ -77,14 +81,21 @@ def _build_system_prompt(
         "Be active and helpful, but concise and safe. "
         "You may choose multiple actions each cycle if useful, or noop when there is nothing new. "
         "Prefer reply when there is an interesting post to engage with. "
+        "If there are no fresh mentions and you still have posting quota, proactively create one original post from fresh evidence. "
         "If you posted recently, avoid posting again unless there is genuinely new value. "
         "Never post duplicate content: do not repost the same news/fact/topic if others already posted it in the provided timeline context. "
+        "Avoid repeating your own recent themes; diversify topics over time when possible. "
         f"Keep every post/reply/dm within {post_char_limit} characters. "
+        f"Current remaining daily quota is posts={remaining_quota.get('posts', 0)}, replies={remaining_quota.get('replies', 0)}, dms={remaining_quota.get('dms', 0)}. Plan actions accordingly. "
+        "For factual/news posts, include at least one source URL when available so readers can verify context. "
+        "Prefer concise posts that include one high-quality link over linkless summaries. "
+        "Never output a truncated or broken URL. If needed, shorten prose and keep URLs complete; if a valid URL cannot fit, post without URL. "
         "If a post is rejected for length, rewrite it shorter with the same core info. "
         "Only follow or DM when it is contextually meaningful. "
         "Never reply to answer a question in your own posts. Never target your own account in follow/dm. "
         "If you have already replied to someone who has not replied back, avoid replying to them again to prevent one-sided conversations. "
         "Never reply to the same mention more than once. NEVER post or reply about the same news/fact/topic more than once. "
+        "NEVER edit or delete posts, as it can be confusing to others. Instead, post a follow-up correction if needed. "
         "You may request web_search_query and web_fetch_url to gather context before deciding. "
         "If you need up-to-date or uncertain factual information, do not speculate: immediately request web_search_query first, then decide from evidence. "
         f"{mention_rule}"
@@ -97,9 +108,11 @@ def _build_system_prompt(
 def _build_decision_prompt(
     home: list[Any],
     notifications: list[Any],
+    thread_hints: list[dict[str, Any]],
     self_id: str,
     self_acct: str,
     post_char_limit: int,
+    remaining_quota: dict[str, int],
 ) -> str:
     sample_home = []
     for item in home[:40]:
@@ -111,6 +124,8 @@ def _build_decision_prompt(
                 "account_id": author_id,
                 "acct": account.get("acct"),
                 "author_is_self": author_id == self_id,
+                "in_reply_to_id": item.get("in_reply_to_id"),
+                "created_at": item.get("created_at"),
                 "content": _strip_html(str(item.get("content", "")))[:280],
             }
         )
@@ -126,6 +141,9 @@ def _build_decision_prompt(
                 "status_id": n.get("status", {}).get("id")
                 if isinstance(n.get("status"), dict)
                 else None,
+                "in_reply_to_id": n.get("status", {}).get("in_reply_to_id")
+                if isinstance(n.get("status"), dict)
+                else None,
                 "from": n.get("account", {}).get("acct"),
                 "text": _strip_html(str((n.get("status") or {}).get("content", "")))[
                     :220
@@ -137,6 +155,8 @@ def _build_decision_prompt(
         {
             "task": "Choose one action for this cycle.",
             "post_char_limit": post_char_limit,
+            "remaining_quota": remaining_quota,
+            "thread_reply_instruction": "When replying in a thread, prefer replying to the newest relevant reply id (last_reply_id) instead of the root post id.",
             "schema": {
                 "action": "post|reply|follow|dm|noop",
                 "text": "required for post/reply/dm",
@@ -160,9 +180,65 @@ def _build_decision_prompt(
             "self": {"account_id": self_id, "acct": self_acct},
             "timeline": sample_home,
             "notifications": sample_notifs,
+            "thread_hints": thread_hints,
         },
         ensure_ascii=True,
     )
+
+
+def _build_thread_hints(
+    agent: AgentClient, notifications: list[Any], self_id: str
+) -> list[dict[str, Any]]:
+    hints: list[dict[str, Any]] = []
+    seen_roots: set[str] = set()
+
+    for n in notifications[:20]:
+        if not isinstance(n, dict):
+            continue
+        status = n.get("status")
+        if not isinstance(status, dict):
+            continue
+        root_id = str(status.get("id") or "")
+        if not root_id or root_id in seen_roots:
+            continue
+        seen_roots.add(root_id)
+
+        latest_id = root_id
+        latest_author = str(((status.get("account") or {}).get("acct") or ""))
+        latest_text = _strip_html(str(status.get("content") or ""))[:220]
+        latest_created = str(status.get("created_at") or "")
+
+        try:
+            ctx = agent.status_context(root_id)
+            descendants = ctx.get("descendants") if isinstance(ctx, dict) else []
+            if isinstance(descendants, list) and descendants:
+                for d in descendants:
+                    if not isinstance(d, dict):
+                        continue
+                    author_id = str(((d.get("account") or {}).get("id") or ""))
+                    if self_id and author_id == self_id:
+                        continue
+                    created = str(d.get("created_at") or "")
+                    if created >= latest_created:
+                        latest_created = created
+                        latest_id = str(d.get("id") or latest_id)
+                        latest_author = str(
+                            ((d.get("account") or {}).get("acct") or "")
+                        )
+                        latest_text = _strip_html(str(d.get("content") or ""))[:220]
+        except Exception:
+            pass
+
+        hints.append(
+            {
+                "root_status_id": root_id,
+                "last_reply_id": latest_id,
+                "last_reply_from": latest_author,
+                "last_reply_text": latest_text,
+            }
+        )
+
+    return hints
 
 
 def _first_mention_status(
@@ -181,28 +257,6 @@ def _first_mention_status(
             continue
         return status
     return None
-
-
-def _build_mention_reply(
-    llm: OllamaClient, persona: str, self_acct: str, status: dict[str, Any]
-) -> str:
-    author = (status.get("account") or {}).get("acct") or ""
-    text = _strip_html(str(status.get("content", "")))[:320]
-    prompt = (
-        "Write one short Mastodon reply (max 280 chars). Keep it friendly, useful, and in persona. "
-        "Do not mention yourself. Return plain text only, no JSON.\n"
-        f"Your acct: {self_acct}\n"
-        f"Persona: {persona}\n"
-        f"Incoming mention from @{author}: {text}"
-    )
-    out = llm.chat(
-        [
-            {"role": "system", "content": "You write concise social replies."},
-            {"role": "user", "content": prompt},
-        ]
-    )
-    out = out.strip().replace("\n", " ")
-    return out[:280] if out else "Thanks for the mention!"
 
 
 def _parse_actions(decision: dict[str, Any]) -> list[dict[str, Any]]:
@@ -243,30 +297,6 @@ def _is_noop_action(decision: dict[str, Any]) -> bool:
             if isinstance(item, dict)
         ]
         return bool(normalized) and all(a in {"", "noop"} for a in normalized)
-    return False
-
-
-def _recent_self_post_exists(
-    home: list[Any], self_id: str, cooldown_minutes: int
-) -> bool:
-    if not self_id:
-        return False
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(1, cooldown_minutes))
-    for item in home:
-        if not isinstance(item, dict):
-            continue
-        author_id = str(((item.get("account") or {}).get("id") or ""))
-        if author_id != self_id:
-            continue
-        created_raw = str(item.get("created_at") or "")
-        if not created_raw:
-            continue
-        try:
-            created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
-        except Exception:
-            continue
-        if created >= cutoff:
-            return True
     return False
 
 
@@ -396,6 +426,7 @@ def run_cycle(
     web: WebTools,
     persona: str,
     *,
+    llm_temperature: float,
     max_actions: int,
     post_cooldown_minutes: int,
 ) -> dict[str, Any]:
@@ -411,7 +442,19 @@ def run_cycle(
     self_id = str(me.get("id") or "")
     self_acct = str(me.get("acct") or me.get("username") or "")
     post_char_limit = agent.max_post_characters()
+    status_snapshot = _safe_agent_status(agent)
+    remaining_quota_raw = (
+        ((status_snapshot.get("limits") or {}).get("remaining") or {})
+        if isinstance(status_snapshot, dict)
+        else {}
+    )
+    remaining_quota = {
+        "posts": int(remaining_quota_raw.get("posts") or 0),
+        "replies": int(remaining_quota_raw.get("replies") or 0),
+        "dms": int(remaining_quota_raw.get("dms") or 0),
+    }
 
+    dismissed_mentions = 0
     try:
         home = agent.read_home(limit=20)
         notifications = agent.mention_notifications_all(page_limit=80)
@@ -430,29 +473,54 @@ def run_cycle(
             "status": _safe_agent_status(agent),
         }
 
+    # Use Mastodon server state for read/unread: once seen this cycle, dismiss them.
+    for n in notifications:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get("id") or "")
+        if not nid:
+            continue
+        try:
+            agent.dismiss_notification(nid)
+            dismissed_mentions += 1
+        except Exception:
+            pass
+
     topic_posts = _select_topic_posts(
         trends, persona, self_id, min_count=10, max_count=20
     )
     prompt_home = topic_posts + home
     first_mention = _first_mention_status(notifications, self_id)
+    thread_hints = _build_thread_hints(agent, notifications, self_id)
 
     messages = [
         {
             "role": "system",
             "content": _build_system_prompt(
-                persona, self_id, self_acct, first_mention is not None, post_char_limit
+                persona,
+                self_id,
+                self_acct,
+                first_mention is not None,
+                post_char_limit,
+                remaining_quota,
             ),
         },
         {
             "role": "user",
             "content": _build_decision_prompt(
-                prompt_home, notifications, self_id, self_acct, post_char_limit
+                prompt_home,
+                notifications,
+                thread_hints,
+                self_id,
+                self_acct,
+                post_char_limit,
+                remaining_quota,
             ),
         },
     ]
 
     convo = list(messages)
-    decision = _extract_json(llm.chat(convo))
+    decision = _extract_json(llm.chat(convo, temperature=llm_temperature))
 
     tool_data: dict[str, Any] = {}
     tool_rounds: list[dict[str, Any]] = []
@@ -514,7 +582,9 @@ def run_cycle(
             ]
         )
 
-        decision = _extract_json(llm.chat(convo)) or decision
+        decision = (
+            _extract_json(llm.chat(convo, temperature=llm_temperature)) or decision
+        )
 
     if not _has_action(decision):
         convo.extend(
@@ -538,7 +608,9 @@ def run_cycle(
                 },
             ]
         )
-        decision = _extract_json(llm.chat(convo)) or decision
+        decision = (
+            _extract_json(llm.chat(convo, temperature=llm_temperature)) or decision
+        )
 
     if _is_noop_action(decision) and tool_rounds:
         has_search_results = (
@@ -546,6 +618,7 @@ def run_cycle(
             and len(tool_data.get("search", [])) > 0
         )
         if has_search_results:
+            preferred_action = "post" if first_mention is None else "reply"
             convo.extend(
                 [
                     {
@@ -557,7 +630,7 @@ def run_cycle(
                         "content": json.dumps(
                             {
                                 "instruction": (
-                                    "You already have search evidence. Produce a concrete action now (prefer post or reply), "
+                                    f"You already have search evidence. Produce a concrete action now (prefer {preferred_action}), "
                                     "not noop, unless all sources are unusable."
                                 ),
                                 "post_char_limit": post_char_limit,
@@ -577,7 +650,9 @@ def run_cycle(
                     },
                 ]
             )
-            decision = _extract_json(llm.chat(convo)) or decision
+            decision = (
+                _extract_json(llm.chat(convo, temperature=llm_temperature)) or decision
+            )
 
     result: dict[str, Any] = {
         "decision": decision,
@@ -587,50 +662,68 @@ def run_cycle(
             "home": len(home),
             "topic_posts": len(topic_posts),
         },
+        "notifications_marked_read": dismissed_mentions,
     }
     if tool_rounds:
         result["tool_data_rounds"] = tool_rounds
 
-    status_by_id: dict[str, dict[str, Any]] = {}
-    for item in home:
-        if isinstance(item, dict) and item.get("id"):
-            status_by_id[str(item["id"])] = item
-
     actions = _parse_actions(decision)
 
-    if first_mention is not None and not any(
-        str(a.get("action", "noop")) == "reply" for a in actions
-    ):
-        reply_text = _build_mention_reply(llm, persona, self_acct, first_mention)
-        mention_action = {
-            "action": "reply",
-            "text": reply_text,
-            "in_reply_to_id": first_mention.get("id"),
-            "reason": "prioritize mention response",
-        }
-        actions = [mention_action] + actions
-        result["decision"] = {"actions": actions, "reason": "mention prioritized"}
-
-    recent_post = _recent_self_post_exists(home, self_id, post_cooldown_minutes)
     executed: list[dict[str, Any]] = []
 
     for action_obj in actions[: max(1, max_actions)]:
         action = str(action_obj.get("action", "noop"))
 
-        def fit_text(value: str) -> str:
-            if len(value) <= post_char_limit:
+        url_pattern = re.compile(r"https?://\S+", flags=re.IGNORECASE)
+
+        def shorten_text_preserve_urls(value: str, target: int) -> str:
+            if len(value) <= target:
                 return value
-            if post_char_limit <= 1:
-                return value[:post_char_limit]
-            return value[: post_char_limit - 1].rstrip() + "…"
+            if target <= 1:
+                return value[:target]
+
+            def shorten_plain(text: str) -> str:
+                if len(text) <= target:
+                    return text
+                if target <= 1:
+                    return text[:target]
+                return text[: target - 1].rstrip() + "…"
+
+            urls = [m.group(0).strip() for m in url_pattern.finditer(value)]
+            if not urls:
+                return shorten_plain(value)
+
+            first_url = urls[0]
+            if len(first_url) > target:
+                no_url = url_pattern.sub("", value)
+                no_url = re.sub(r"\s+", " ", no_url).strip()
+                return shorten_plain(no_url)
+
+            prose = url_pattern.sub("", value)
+            prose = re.sub(r"\s+", " ", prose).strip()
+            reserve = len(first_url) + (1 if prose else 0)
+            available = target - reserve
+            if available < 0:
+                return shorten_plain(prose)
+
+            if len(prose) > available:
+                if available <= 1:
+                    prose = ""
+                else:
+                    prose = prose[: available - 1].rstrip() + "…"
+
+            out = f"{prose} {first_url}".strip() if prose else first_url
+            if len(out) <= target:
+                return out
+
+            return shorten_plain(prose)
+
+        def fit_text(value: str) -> str:
+            return shorten_text_preserve_urls(value, post_char_limit)
 
         def shrink_more(value: str) -> str:
             soft = max(40, int(post_char_limit * 0.85))
-            if len(value) <= soft:
-                return value
-            if soft <= 1:
-                return value[:soft]
-            return value[: soft - 1].rstrip() + "…"
+            return shorten_text_preserve_urls(value, soft)
 
         def is_too_long_error(error: Exception) -> bool:
             if not isinstance(error, httpx.HTTPStatusError):
@@ -641,12 +734,15 @@ def run_cycle(
             return "too long" in body or "validation failed" in body and "text" in body
 
         if action == "post" and action_obj.get("text"):
-            if recent_post:
+            candidate = fit_text(str(action_obj["text"]))
+            if not candidate:
                 executed.append(
-                    {"action": "noop", "reason": "recent self post cooldown"}
+                    {
+                        "action": "noop",
+                        "reason": "post text cannot fit limit without breaking URL",
+                    }
                 )
                 continue
-            candidate = fit_text(str(action_obj["text"]))
             try:
                 executed.append({"action": "post", "result": agent.post(candidate)})
             except Exception as error:
@@ -661,7 +757,6 @@ def run_cycle(
                                     "note": "retried with shorter text",
                                 }
                             )
-                            recent_post = True
                             continue
                         except Exception as retry_error:
                             error = retry_error
@@ -673,7 +768,6 @@ def run_cycle(
                     }
                 )
                 continue
-            recent_post = True
             continue
 
         if (
@@ -682,14 +776,15 @@ def run_cycle(
             and action_obj.get("in_reply_to_id")
         ):
             target_id = str(action_obj["in_reply_to_id"])
-            target_status = status_by_id.get(target_id)
-            target_author_id = str(
-                ((target_status or {}).get("account") or {}).get("id") or ""
-            )
-            if self_id and target_author_id == self_id:
-                executed.append({"action": "noop", "reason": "blocked self-reply"})
-                continue
             reply_text = fit_text(str(action_obj["text"]))
+            if not reply_text:
+                executed.append(
+                    {
+                        "action": "noop",
+                        "reason": "reply text cannot fit limit without breaking URL",
+                    }
+                )
+                continue
             try:
                 executed.append(
                     {
@@ -721,10 +816,6 @@ def run_cycle(
             continue
 
         if action == "follow" and action_obj.get("target_acct"):
-            target = str(action_obj["target_acct"]).lstrip("@")
-            if target == self_acct.lstrip("@"):
-                executed.append({"action": "noop", "reason": "blocked self-follow"})
-                continue
             try:
                 executed.append(
                     {
@@ -743,11 +834,15 @@ def run_cycle(
             continue
 
         if action == "dm" and action_obj.get("target_acct") and action_obj.get("text"):
-            target = str(action_obj["target_acct"]).lstrip("@")
-            if target == self_acct.lstrip("@"):
-                executed.append({"action": "noop", "reason": "blocked self-dm"})
-                continue
             dm_text = fit_text(str(action_obj["text"]))
+            if not dm_text:
+                executed.append(
+                    {
+                        "action": "noop",
+                        "reason": "dm text cannot fit limit without breaking URL",
+                    }
+                )
+                continue
             try:
                 executed.append(
                     {
@@ -790,7 +885,7 @@ def run_cycle(
     result["execution"] = executed
     result["post_char_limit"] = post_char_limit
 
-    result["status"] = _safe_agent_status(agent)
+    result["status"] = status_snapshot
     return result
 
 
@@ -838,11 +933,27 @@ def main() -> None:
         or ("http://127.0.0.1:11434" if mode == "local" else "https://ollama.com")
     )
     api_key = str(llm_cfg.get("api_key") or os.getenv("OLLAMA_API_KEY", ""))
-    max_tokens_raw = llm_cfg.get("max_tokens") or os.getenv("OLLAMA_MAX_TOKENS", "2048")
+    max_tokens_raw = llm_cfg.get("max_tokens") or os.getenv(
+        "OLLAMA_MAX_TOKENS", "65536"
+    )
+    max_ctx_raw = llm_cfg.get("max_context_tokens") or os.getenv(
+        "OLLAMA_MAX_CONTEXT_TOKENS", "131072"
+    )
+    temperature_raw = llm_cfg.get("temperature") or os.getenv(
+        "OLLAMA_TEMPERATURE", "0.9"
+    )
     try:
         max_tokens = int(str(max_tokens_raw))
     except Exception:
-        max_tokens = 2048
+        max_tokens = 65536
+    try:
+        max_ctx = int(str(max_ctx_raw))
+    except Exception:
+        max_ctx = 131072
+    try:
+        llm_temperature = float(str(temperature_raw))
+    except Exception:
+        llm_temperature = 0.9
 
     agent = AgentClient(
         base_url=args.base_url, token=token, allow_insecure_tls=allow_insecure_tls
@@ -853,6 +964,7 @@ def main() -> None:
         base_url=base,
         api_key=api_key,
         max_output_tokens=max_tokens,
+        max_context_tokens=max_ctx,
         allow_insecure_tls=allow_insecure_tls,
     )
     web = WebTools(allow_insecure_tls=allow_insecure_tls)
@@ -865,6 +977,7 @@ def main() -> None:
                     llm,
                     web,
                     persona,
+                    llm_temperature=llm_temperature,
                     max_actions=args.max_actions,
                     post_cooldown_minutes=args.post_cooldown_minutes,
                 )

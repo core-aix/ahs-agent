@@ -161,11 +161,77 @@ class AgentClient:
 
         return out
 
+    def mention_notifications_since(
+        self, since_id: str | None, page_limit: int = 80
+    ) -> list[dict[str, Any]]:
+        per_page = max(1, min(page_limit, 80))
+        max_id: str | None = None
+        out: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+
+        since_num: int | None = None
+        try:
+            since_num = int(str(since_id)) if since_id else None
+        except Exception:
+            since_num = None
+
+        for _ in range(25):
+            path = f"/api/v1/notifications?types[]=mention&limit={per_page}"
+            if max_id:
+                path += f"&max_id={quote(max_id)}"
+
+            payload = self._json("GET", path)
+            if not isinstance(payload, list) or not payload:
+                break
+
+            page_items: list[dict[str, Any]] = []
+            reached_seen_boundary = False
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                nid = str(item.get("id") or "")
+                if not nid or nid in seen_ids:
+                    continue
+
+                if since_num is not None:
+                    try:
+                        if int(nid) <= since_num:
+                            reached_seen_boundary = True
+                            continue
+                    except Exception:
+                        pass
+
+                seen_ids.add(nid)
+                page_items.append(item)
+
+            if page_items:
+                out.extend(page_items)
+
+            last_id = str((payload[-1] or {}).get("id") or "")
+            if not last_id:
+                break
+            max_id = last_id
+
+            if len(payload) < per_page or reached_seen_boundary:
+                break
+
+        return out
+
+    def dismiss_notification(self, notification_id: str) -> dict[str, Any]:
+        payload = self._json(
+            "POST", f"/api/v1/notifications/{quote(str(notification_id))}/dismiss"
+        )
+        return dict(payload) if isinstance(payload, dict) else {}
+
     def trends_statuses(self, limit: int = 20) -> list[Any]:
         payload = self._json(
             "GET", f"/api/v1/trends/statuses?limit={max(1, min(limit, 40))}"
         )
         return payload if isinstance(payload, list) else []
+
+    def status_context(self, status_id: str) -> dict[str, Any]:
+        payload = self._json("GET", f"/api/v1/statuses/{quote(str(status_id))}/context")
+        return dict(payload) if isinstance(payload, dict) else {}
 
     def search_accounts(self, acct_query: str, limit: int = 5) -> list[Any]:
         payload = self._json(

@@ -288,7 +288,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_llm.add_argument(
         "--ollama-max-tokens",
         type=int,
-        default=int(os.getenv("OLLAMA_MAX_TOKENS", "2048")),
+        default=int(os.getenv("OLLAMA_MAX_TOKENS", "65536")),
+    )
+    p_llm.add_argument(
+        "--ollama-max-context-tokens",
+        type=int,
+        default=int(os.getenv("OLLAMA_MAX_CONTEXT_TOKENS", "131072")),
+    )
+    p_llm.add_argument(
+        "--ollama-temperature",
+        type=float,
+        default=float(os.getenv("OLLAMA_TEMPERATURE", "0.9")),
     )
     p_llm.add_argument("--ollama-api-key", default=os.getenv("OLLAMA_API_KEY", ""))
     p_llm.add_argument("--skip-connect", action="store_true")
@@ -414,6 +424,8 @@ def main() -> None:
                     "model": args.ollama_model,
                     "api_key": ollama_api_key,
                     "max_tokens": int(args.ollama_max_tokens),
+                    "max_context_tokens": int(args.ollama_max_context_tokens),
+                    "temperature": float(args.ollama_temperature),
                 },
             )
 
@@ -431,6 +443,8 @@ def main() -> None:
                             "base_url": args.ollama_base_url,
                             "model": args.ollama_model,
                             "max_tokens": int(args.ollama_max_tokens),
+                            "max_context_tokens": int(args.ollama_max_context_tokens),
+                            "temperature": float(args.ollama_temperature),
                             "api_key_set": bool(ollama_api_key),
                         },
                     },

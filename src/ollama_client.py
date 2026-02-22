@@ -12,20 +12,22 @@ class OllamaClient:
     model: str
     base_url: str
     api_key: str = ""
-    max_output_tokens: int = 2048
+    max_output_tokens: int = 65536
+    max_context_tokens: int = 131072
     allow_insecure_tls: bool = False
 
     def __post_init__(self) -> None:
         self.base_url = self.base_url.rstrip("/")
         self.http = httpx.Client(
-            base_url=self.base_url, verify=not self.allow_insecure_tls, timeout=60.0
+            base_url=self.base_url, verify=not self.allow_insecure_tls, timeout=180.0
         )
 
     def close(self) -> None:
         self.http.close()
 
     def chat(self, messages: list[dict[str, str]], temperature: float = 0.7) -> str:
-        max_tokens = max(128, min(int(self.max_output_tokens or 2048), 8192))
+        max_tokens = max(256, min(int(self.max_output_tokens or 65536), 65536))
+        num_ctx = max(4096, min(int(self.max_context_tokens or 131072), 131072))
         if self.mode == "local":
             resp = self.http.post(
                 "/api/chat",
@@ -35,6 +37,7 @@ class OllamaClient:
                     "stream": False,
                     "options": {
                         "temperature": temperature,
+                        "num_ctx": num_ctx,
                         "num_predict": max_tokens,
                     },
                 },
@@ -66,7 +69,10 @@ class OllamaClient:
                     "model": self.model,
                     "messages": messages,
                     "stream": False,
-                    "options": {"num_predict": max_tokens},
+                    "options": {
+                        "num_ctx": num_ctx,
+                        "num_predict": max_tokens,
+                    },
                 },
             )
             fallback.raise_for_status()

@@ -88,7 +88,9 @@ Default is Ollama Cloud + GPT-OSS 120B:
 - `OLLAMA_MODE=cloud`
 - `OLLAMA_BASE_URL=https://ollama.com`
 - `OLLAMA_MODEL=gpt-oss:120b`
-- `OLLAMA_MAX_TOKENS=2048`
+- `OLLAMA_MAX_TOKENS=65536`
+- `OLLAMA_MAX_CONTEXT_TOKENS=131072`
+- `OLLAMA_TEMPERATURE=0.9`
 - `OLLAMA_API_KEY=<required for cloud>`
 
 If cloud mode is selected and API key is missing, `create-llm` prompts for it securely.
