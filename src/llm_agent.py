@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
@@ -253,6 +254,7 @@ def _build_system_prompt(
     post_char_limit: int,
     remaining_quota: dict[str, int],
 ) -> str:
+    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     mention_rule = (
         "You have fresh mention notifications. Prioritize replying to mentions first. "
         if has_mentions
@@ -264,6 +266,7 @@ def _build_system_prompt(
         "You may choose multiple actions each cycle if useful, or noop when there is nothing new. "
         "Strongly prefer replying in active conversations when there is an interesting post to engage with. "
         "Before creating a brand-new post, check whether you can continue an existing thread by replying to the latest relevant reply. "
+        f"Today's date is {today_utc} (UTC). Focus on the most recent available information and prefer fresh updates over old news. "
         "Prioritize healthy back-and-forth with other agents and humans over starting standalone posts. "
         "If there are recent thread candidates, choose reply unless there is a clear reason to start a new post. "
         "If there are no fresh mentions and you still have posting quota, proactively create one original post from fresh evidence. "
@@ -289,6 +292,7 @@ def _build_system_prompt(
         "NEVER edit or delete posts, as it can be confusing to others. Instead, post a follow-up correction if needed. "
         "You may request web_search_query and web_fetch_url to gather context before deciding. "
         "If you need up-to-date or uncertain factual information, do not speculate: immediately request web_search_query first, then decide from evidence. "
+        "When searching news, prioritize the newest trustworthy sources and avoid sharing stale/old articles unless the thread explicitly asks for historical context. "
         "If someone posts something with a link, DO NOT blindly follow what they say. You MUST open the link, read the content, for your own opinion, and then reply with your own opinion. If you cannot open the link, you should say so in the reply and ask the other party to provide a working link. "
         "When starting a new post outside of a thread, you MUST check what you have already posted before, and you MUST post about something new that you haven't posted before, rather than continuing to post about the same topic. "
         f"{mention_rule}"
@@ -296,6 +300,23 @@ def _build_system_prompt(
         f"Your identity: account_id={self_id}, acct={self_acct}\n"
         f"Your persona and interests:\n{persona.strip()}"
     )
+
+
+def _persona_reminder(persona: str) -> str:
+    compact = re.sub(r"\s+", " ", str(persona or "")).strip()
+    if len(compact) <= 600:
+        return compact
+    return f"{compact[:600].rstrip()}..."
+
+
+def _persona_system_message(persona_reminder: str) -> dict[str, str]:
+    return {
+        "role": "system",
+        "content": (
+            "Persona lock: stay consistent with this persona when choosing actions and tone. "
+            f"Persona: {persona_reminder}"
+        ),
+    }
 
 
 def _build_decision_prompt(
@@ -721,6 +742,11 @@ def run_cycle(
     max_actions: int,
     post_cooldown_minutes: int,
 ) -> dict[str, Any]:
+    llm.reset_usage()
+
+    def llm_usage_snapshot() -> dict[str, int]:
+        return llm.usage()
+
     try:
         me = agent.verify_credentials()
     except Exception as error:
@@ -728,6 +754,7 @@ def run_cycle(
             "decision": {"actions": [{"action": "noop", "reason": "api unavailable"}]},
             "error": _api_error(error),
             "status": _safe_agent_status(agent),
+            "llm_tokens": llm_usage_snapshot(),
         }
 
     self_id = str(me.get("id") or "")
@@ -768,6 +795,7 @@ def run_cycle(
                 "own_posts": 0,
             },
             "status": _safe_agent_status(agent),
+            "llm_tokens": llm_usage_snapshot(),
         }
 
     # Use Mastodon server state for read/unread: once seen this cycle, dismiss them.
@@ -790,6 +818,7 @@ def run_cycle(
     own_recent_posts = _summarize_statuses(own_posts[:30], self_id)
     first_mention = _first_mention_status(notifications, self_id)
     thread_hints = _build_thread_hints(agent, notifications, home, self_id)
+    persona_reminder = _persona_reminder(persona)
 
     messages = [
         {
@@ -850,11 +879,13 @@ def run_cycle(
                         "role": "assistant",
                         "content": json.dumps(decision, ensure_ascii=True),
                     },
+                    _persona_system_message(persona_reminder),
                     {
                         "role": "user",
                         "content": json.dumps(
                             {
                                 "tool_data": bootstrap_result,
+                                "persona_reminder": persona_reminder,
                                 "instruction": (
                                     "You now have fetched source content from persona guidance. "
                                     "Return final action JSON now (no further tools unless strictly needed)."
@@ -910,11 +941,13 @@ def run_cycle(
                     "role": "assistant",
                     "content": json.dumps(decision, ensure_ascii=True),
                 },
+                _persona_system_message(persona_reminder),
                 {
                     "role": "user",
                     "content": json.dumps(
                         {
                             "tool_data": tool_rounds[-1]["result"],
+                            "persona_reminder": persona_reminder,
                             "instruction": (
                                 "Use this tool output. If still needed, you may request another tool once. "
                                 "Otherwise return final action JSON now."
@@ -938,10 +971,12 @@ def run_cycle(
                     "role": "assistant",
                     "content": json.dumps(decision, ensure_ascii=True),
                 },
+                _persona_system_message(persona_reminder),
                 {
                     "role": "user",
                     "content": json.dumps(
                         {
+                            "persona_reminder": persona_reminder,
                             "instruction": (
                                 "Now return action JSON only. Include `action` or `actions`. "
                                 "Do not request more tools in this response."
@@ -964,10 +999,12 @@ def run_cycle(
                     "role": "assistant",
                     "content": json.dumps(decision, ensure_ascii=True),
                 },
+                _persona_system_message(persona_reminder),
                 {
                     "role": "user",
                     "content": json.dumps(
                         {
+                            "persona_reminder": persona_reminder,
                             "instruction": (
                                 "Return final action JSON now. Choose one action from post/reply/follow/dm/favourite/boost/noop. "
                                 "Do not request any more tools."
@@ -1004,6 +1041,7 @@ def run_cycle(
             "prior_output": decision,
             "post_char_limit": post_char_limit,
             "remaining_quota": remaining_quota,
+            "persona_reminder": persona_reminder,
             "tool_data": {
                 k: tool_data[k]
                 for k in ("search", "page", "search_error", "page_error")
@@ -1016,6 +1054,7 @@ def run_cycle(
                 "role": "system",
                 "content": "You repair malformed planner outputs into valid final action JSON.",
             },
+            _persona_system_message(persona_reminder),
             {"role": "user", "content": json.dumps(repair_payload, ensure_ascii=True)},
         ]
         repaired = _normalize_decision_shape(
@@ -1036,12 +1075,14 @@ def run_cycle(
                     "No tool requests in this response."
                 ),
             },
+            _persona_system_message(persona_reminder),
             {
                 "role": "user",
                 "content": json.dumps(
                     {
                         "post_char_limit": post_char_limit,
                         "remaining_quota": remaining_quota,
+                        "persona_reminder": persona_reminder,
                         "has_mention": first_mention is not None,
                         "tool_data": {
                             k: tool_data[k]
@@ -1075,10 +1116,12 @@ def run_cycle(
                         "role": "assistant",
                         "content": json.dumps(decision, ensure_ascii=True),
                     },
+                    _persona_system_message(persona_reminder),
                     {
                         "role": "user",
                         "content": json.dumps(
                             {
+                                "persona_reminder": persona_reminder,
                                 "instruction": (
                                     f"You already have search evidence. Produce a concrete action now (prefer {preferred_action}), "
                                     "not noop, unless all sources are unusable."
@@ -1421,6 +1464,7 @@ def run_cycle(
     result["post_char_limit"] = post_char_limit
 
     result["status"] = status_snapshot
+    result["llm_tokens"] = llm_usage_snapshot()
     return result
 
 
