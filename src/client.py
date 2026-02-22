@@ -67,6 +67,13 @@ class AgentClient:
         )
         return payload if isinstance(payload, list) else []
 
+    def account_statuses(self, account_id: str, limit: int = 20) -> list[Any]:
+        payload = self._json(
+            "GET",
+            f"/api/v1/accounts/{quote(str(account_id))}/statuses?limit={max(1, min(limit, 80))}&exclude_reblogs=true",
+        )
+        return payload if isinstance(payload, list) else []
+
     def follow(self, acct: str) -> dict[str, Any]:
         found = self._json(
             "GET",

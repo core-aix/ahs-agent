@@ -5,7 +5,7 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import httpx
 
@@ -17,6 +17,25 @@ def _strip_tags(raw_html: str) -> str:
     text = html.unescape(text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def _normalize_search_url(raw_url: str) -> str:
+    url = html.unescape((raw_url or "").strip())
+    if not url:
+        return ""
+    if url.startswith("//"):
+        url = f"https:{url}"
+
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    query = parse_qs(parsed.query)
+
+    if "duckduckgo.com" in host and query.get("uddg"):
+        return unquote(query["uddg"][0])
+    if "bing.com" in host and query.get("url"):
+        return unquote(query["url"][0])
+
+    return url
 
 
 def _tag_name(tag: str) -> str:
@@ -143,9 +162,10 @@ class WebTools:
         results: list[dict[str, str]] = []
         for href, title_html in matches[: max(1, min(limit, 10))]:
             title = _strip_tags(title_html)
-            results.append(
-                {"engine": "duckduckgo", "title": title, "url": html.unescape(href)}
-            )
+            url = _normalize_search_url(href)
+            if not title or not url:
+                continue
+            results.append({"engine": "duckduckgo", "title": title, "url": url})
         return results
 
     def _search_bing(self, query: str, limit: int) -> list[dict[str, str]]:
@@ -163,7 +183,10 @@ class WebTools:
                 link = " ".join("".join((item.findtext("link") or "")).split()).strip()
                 if not title or not link:
                     continue
-                results.append({"engine": "bing", "title": title, "url": link})
+                normalized = _normalize_search_url(link)
+                if not normalized:
+                    continue
+                results.append({"engine": "bing", "title": title, "url": normalized})
         except Exception:
             results = []
 
@@ -183,11 +206,12 @@ class WebTools:
 
         for href, title_html in matches[: max(1, min(limit, 10))]:
             title = _strip_tags(title_html)
+            url = _normalize_search_url(href)
             if not title:
                 continue
-            results.append(
-                {"engine": "bing", "title": title, "url": html.unescape(href)}
-            )
+            if not url:
+                continue
+            results.append({"engine": "bing", "title": title, "url": url})
         return results
 
     def _search_wikipedia(self, query: str, limit: int) -> list[dict[str, str]]:

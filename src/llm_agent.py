@@ -80,10 +80,14 @@ def _build_system_prompt(
         "You are an autonomous social agent on Mastodon. "
         "Be active and helpful, but concise and safe. "
         "You may choose multiple actions each cycle if useful, or noop when there is nothing new. "
-        "Prefer reply when there is an interesting post to engage with. "
+        "Prefer replying in active conversations when there is an interesting post to engage with. "
+        "Before creating a brand-new post, check whether you can continue an existing thread by replying to the latest relevant reply. "
+        "Prioritize healthy back-and-forth with other agents and humans over starting too many standalone posts. "
         "If there are no fresh mentions and you still have posting quota, proactively create one original post from fresh evidence. "
         "If you posted recently, avoid posting again unless there is genuinely new value. "
-        "Never post duplicate content: do not repost the same news/fact/topic if others already posted it in the provided timeline context. "
+        "Never post duplicate content: do not repost the same or similar news/fact/topic if others already posted it in the provided timeline context. "
+        "Critically compare against your own recent posts and avoid posting the same or very similar content again. "
+        "If your draft overlaps strongly with your own recent posts, switch to replying in-thread or pick a different topic. "
         "Avoid repeating your own recent themes; diversify topics over time when possible. "
         f"Keep every post/reply/dm within {post_char_limit} characters. "
         f"Current remaining daily quota is posts={remaining_quota.get('posts', 0)}, replies={remaining_quota.get('replies', 0)}, dms={remaining_quota.get('dms', 0)}. Plan actions accordingly. "
@@ -98,6 +102,8 @@ def _build_system_prompt(
         "NEVER edit or delete posts, as it can be confusing to others. Instead, post a follow-up correction if needed. "
         "You may request web_search_query and web_fetch_url to gather context before deciding. "
         "If you need up-to-date or uncertain factual information, do not speculate: immediately request web_search_query first, then decide from evidence. "
+        "If someone posts something with a link, DO NOT blindly follow what they say. You MUST open the link, read the content, for your own opinion, and then reply with your own opinion. If you cannot open the link, you should say so in the reply and ask the other party to provide a working link. "
+        "When starting a new post outside of a thread, you MUST check what you have already posted before, and you MUST post about something new that you haven't posted before, rather than continuing to post about the same topic. "
         f"{mention_rule}"
         "Return strict JSON only.\n\n"
         f"Your identity: account_id={self_id}, acct={self_acct}\n"
@@ -109,13 +115,14 @@ def _build_decision_prompt(
     home: list[Any],
     notifications: list[Any],
     thread_hints: list[dict[str, Any]],
+    own_recent_posts: list[dict[str, Any]],
     self_id: str,
     self_acct: str,
     post_char_limit: int,
     remaining_quota: dict[str, int],
 ) -> str:
     sample_home = []
-    for item in home[:40]:
+    for item in home[:80]:
         account = item.get("account", {}) if isinstance(item, dict) else {}
         author_id = str(account.get("id") or "")
         sample_home.append(
@@ -181,53 +188,142 @@ def _build_decision_prompt(
             "timeline": sample_home,
             "notifications": sample_notifs,
             "thread_hints": thread_hints,
+            "own_recent_posts": own_recent_posts,
         },
         ensure_ascii=True,
     )
 
 
+def _summarize_statuses(statuses: list[Any], self_id: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in statuses:
+        if not isinstance(item, dict):
+            continue
+        account = item.get("account") or {}
+        author_id = str(account.get("id") or "") if isinstance(account, dict) else ""
+        out.append(
+            {
+                "id": item.get("id"),
+                "account_id": author_id,
+                "acct": account.get("acct") if isinstance(account, dict) else "",
+                "author_is_self": author_id == self_id,
+                "in_reply_to_id": item.get("in_reply_to_id"),
+                "created_at": item.get("created_at"),
+                "content": _strip_html(str(item.get("content", "")))[:280],
+            }
+        )
+    return out
+
+
+def _merge_unique_statuses(*groups: list[Any]) -> list[Any]:
+    out: list[Any] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group:
+            if not isinstance(item, dict):
+                continue
+            sid = str(item.get("id") or "")
+            if sid and sid in seen:
+                continue
+            if sid:
+                seen.add(sid)
+            out.append(item)
+    return out
+
+
 def _build_thread_hints(
-    agent: AgentClient, notifications: list[Any], self_id: str
+    agent: AgentClient,
+    notifications: list[Any],
+    home: list[Any],
+    self_id: str,
 ) -> list[dict[str, Any]]:
     hints: list[dict[str, Any]] = []
-    seen_roots: set[str] = set()
+    seed_ids: list[str] = []
+    seen_seed_ids: set[str] = set()
 
-    for n in notifications[:20]:
+    for n in notifications[:40]:
         if not isinstance(n, dict):
             continue
         status = n.get("status")
         if not isinstance(status, dict):
             continue
-        root_id = str(status.get("id") or "")
-        if not root_id or root_id in seen_roots:
+        sid = str(status.get("id") or "")
+        if not sid or sid in seen_seed_ids:
+            continue
+        seen_seed_ids.add(sid)
+        seed_ids.append(sid)
+
+    for item in home[:40]:
+        if not isinstance(item, dict):
+            continue
+        account = item.get("account") or {}
+        author_id = str((account.get("id") or "")) if isinstance(account, dict) else ""
+        if self_id and author_id == self_id:
+            continue
+        has_thread_signal = (
+            bool(item.get("in_reply_to_id")) or int(item.get("replies_count") or 0) > 0
+        )
+        if not has_thread_signal:
+            continue
+        sid = str(item.get("id") or "")
+        if not sid or sid in seen_seed_ids:
+            continue
+        seen_seed_ids.add(sid)
+        seed_ids.append(sid)
+
+    seen_roots: set[str] = set()
+    for seed_id in seed_ids[:15]:
+        root_id = seed_id
+        try:
+            seed_ctx = agent.status_context(seed_id)
+            ancestors = seed_ctx.get("ancestors") if isinstance(seed_ctx, dict) else []
+            if isinstance(ancestors, list) and ancestors:
+                first = ancestors[0]
+                if isinstance(first, dict) and first.get("id"):
+                    root_id = str(first.get("id"))
+        except Exception:
+            pass
+
+        if root_id in seen_roots:
             continue
         seen_roots.add(root_id)
 
         latest_id = root_id
-        latest_author = str(((status.get("account") or {}).get("acct") or ""))
-        latest_text = _strip_html(str(status.get("content") or ""))[:220]
-        latest_created = str(status.get("created_at") or "")
+        latest_author = ""
+        latest_text = ""
+        latest_created = ""
 
         try:
             ctx = agent.status_context(root_id)
+            ancestors = ctx.get("ancestors") if isinstance(ctx, dict) else []
             descendants = ctx.get("descendants") if isinstance(ctx, dict) else []
-            if isinstance(descendants, list) and descendants:
-                for d in descendants:
-                    if not isinstance(d, dict):
-                        continue
-                    author_id = str(((d.get("account") or {}).get("id") or ""))
-                    if self_id and author_id == self_id:
-                        continue
-                    created = str(d.get("created_at") or "")
-                    if created >= latest_created:
-                        latest_created = created
-                        latest_id = str(d.get("id") or latest_id)
-                        latest_author = str(
-                            ((d.get("account") or {}).get("acct") or "")
-                        )
-                        latest_text = _strip_html(str(d.get("content") or ""))[:220]
+            candidates: list[dict[str, Any]] = []
+            if isinstance(ancestors, list):
+                candidates.extend([a for a in ancestors if isinstance(a, dict)])
+            if isinstance(descendants, list):
+                candidates.extend([d for d in descendants if isinstance(d, dict)])
+
+            if not candidates:
+                continue
+
+            for c in candidates:
+                author_id = str(((c.get("account") or {}).get("id") or ""))
+                if self_id and author_id == self_id:
+                    continue
+                created = str(c.get("created_at") or "")
+                cid = str(c.get("id") or "")
+                if not cid:
+                    continue
+                if created >= latest_created:
+                    latest_created = created
+                    latest_id = cid
+                    latest_author = str(((c.get("account") or {}).get("acct") or ""))
+                    latest_text = _strip_html(str(c.get("content") or ""))[:220]
         except Exception:
             pass
+
+        if not latest_id:
+            continue
 
         hints.append(
             {
@@ -456,9 +552,10 @@ def run_cycle(
 
     dismissed_mentions = 0
     try:
-        home = agent.read_home(limit=20)
+        home = agent.read_home(limit=60)
+        own_posts = agent.account_statuses(self_id, limit=40) if self_id else []
         notifications = agent.mention_notifications_all(page_limit=80)
-        trends = agent.trends_statuses(limit=40)
+        trends = agent.trends_statuses(limit=80)
     except Exception as error:
         reason = (
             "rate limited"
@@ -469,7 +566,12 @@ def run_cycle(
         return {
             "decision": {"actions": [{"action": "noop", "reason": reason}]},
             "error": _api_error(error),
-            "read_scope": {"mentions": 0, "home": 0, "topic_posts": 0},
+            "read_scope": {
+                "mentions": 0,
+                "home": 0,
+                "topic_posts": 0,
+                "own_posts": 0,
+            },
             "status": _safe_agent_status(agent),
         }
 
@@ -487,11 +589,12 @@ def run_cycle(
             pass
 
     topic_posts = _select_topic_posts(
-        trends, persona, self_id, min_count=10, max_count=20
+        trends, persona, self_id, min_count=20, max_count=40
     )
-    prompt_home = topic_posts + home
+    prompt_home = _merge_unique_statuses(home, topic_posts, own_posts)
+    own_recent_posts = _summarize_statuses(own_posts[:30], self_id)
     first_mention = _first_mention_status(notifications, self_id)
-    thread_hints = _build_thread_hints(agent, notifications, self_id)
+    thread_hints = _build_thread_hints(agent, notifications, home, self_id)
 
     messages = [
         {
@@ -511,6 +614,7 @@ def run_cycle(
                 prompt_home,
                 notifications,
                 thread_hints,
+                own_recent_posts,
                 self_id,
                 self_acct,
                 post_char_limit,
@@ -661,6 +765,7 @@ def run_cycle(
             "mentions": len(notifications),
             "home": len(home),
             "topic_posts": len(topic_posts),
+            "own_posts": len(own_posts),
         },
         "notifications_marked_read": dismissed_mentions,
     }
