@@ -240,6 +240,20 @@ class AgentClient:
         payload = self._json("GET", f"/api/v1/statuses/{quote(str(status_id))}/context")
         return dict(payload) if isinstance(payload, dict) else {}
 
+    def status(self, status_id: str) -> dict[str, Any]:
+        payload = self._json("GET", f"/api/v1/statuses/{quote(str(status_id))}")
+        return dict(payload) if isinstance(payload, dict) else {}
+
+    def favourite(self, status_id: str) -> dict[str, Any]:
+        payload = self._json(
+            "POST", f"/api/v1/statuses/{quote(str(status_id))}/favourite"
+        )
+        return dict(payload) if isinstance(payload, dict) else {}
+
+    def boost(self, status_id: str) -> dict[str, Any]:
+        payload = self._json("POST", f"/api/v1/statuses/{quote(str(status_id))}/reblog")
+        return dict(payload) if isinstance(payload, dict) else {}
+
     def search_accounts(self, acct_query: str, limit: int = 5) -> list[Any]:
         payload = self._json(
             "GET",

@@ -7,6 +7,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -16,6 +17,23 @@ from client import AgentClient
 from ollama_client import OllamaClient
 from registry import AgentRegistry
 from web_tools import WebTools
+
+
+URL_PATTERN = re.compile(r"https?://\S+", flags=re.IGNORECASE)
+HREF_PATTERN = re.compile(r"href\s*=\s*['\"]([^'\"]+)['\"]", flags=re.IGNORECASE)
+ALLOWED_ACTIONS = {"post", "reply", "follow", "dm", "favourite", "boost", "noop"}
+ACTION_ALIASES = {
+    "favorite": "favourite",
+    "like": "favourite",
+    "star": "favourite",
+    "fav": "favourite",
+    "reblog": "boost",
+}
+
+
+def _normalized_action(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    return ACTION_ALIASES.get(raw, raw)
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,6 +65,156 @@ def _strip_html(text: str) -> str:
     return cleaned.strip()
 
 
+def _normalize_url(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if u.startswith("//"):
+        u = f"https:{u}"
+    parsed = urlparse(u)
+    host = (parsed.netloc or "").lower()
+    q = parse_qs(parsed.query)
+    if "bing.com" in host and q.get("url"):
+        return unquote(q["url"][0])
+    if "duckduckgo.com" in host and q.get("uddg"):
+        return unquote(q["uddg"][0])
+    return u
+
+
+def _sanitize_text_urls(text: str) -> str:
+    urls = [
+        _normalize_url(m.group(0).rstrip(".,);]")) for m in URL_PATTERN.finditer(text)
+    ]
+
+    valid: list[str] = []
+    for u in urls:
+        try:
+            p = urlparse(u)
+            if p.scheme in {"http", "https"} and p.netloc and "." in p.netloc:
+                valid.append(u)
+        except Exception:
+            continue
+
+    prose = URL_PATTERN.sub("", text)
+    prose = re.sub(r"\(\s*\)", "", prose)
+    prose = re.sub(r"\[\s*\]", "", prose)
+    prose = re.sub(r"\{\s*\}", "", prose)
+    prose = re.sub(r"\s+([,.;:!?])", r"\1", prose)
+    prose = re.sub(r"([\(\[\{])\s+", r"\1", prose)
+    prose = re.sub(r"\s+([\)\]\}])", r"\1", prose)
+    prose = re.sub(r"[\(\[\{]\s*$", "", prose)
+    prose = re.sub(r"\s+", " ", prose).strip()
+    if not valid:
+        return prose
+
+    # Keep one canonical source link to avoid giant/truncated link bundles.
+    return f"{prose} {valid[0]}".strip() if prose else valid[0]
+
+
+def _extract_urls_from_html(text: str) -> list[str]:
+    urls: list[str] = []
+    for match in HREF_PATTERN.finditer(text or ""):
+        candidate = _normalize_url(str(match.group(1) or "").strip())
+        if candidate:
+            urls.append(candidate)
+    return urls
+
+
+def _extract_urls_from_text(text: str) -> list[str]:
+    urls: list[str] = []
+    for match in URL_PATTERN.finditer(text or ""):
+        candidate = _normalize_url(match.group(0).strip().rstrip(".,);]"))
+        if candidate:
+            urls.append(candidate)
+    return urls
+
+
+def _status_urls(status: dict[str, Any]) -> list[str]:
+    if not isinstance(status, dict):
+        return []
+
+    candidates: list[str] = []
+    content = str(status.get("content") or "")
+    candidates.extend(_extract_urls_from_html(content))
+    candidates.extend(_extract_urls_from_text(content))
+
+    status_url = _normalize_url(str(status.get("url") or "").strip())
+    if status_url:
+        candidates.append(status_url)
+
+    card = status.get("card")
+    if isinstance(card, dict):
+        card_url = _normalize_url(str(card.get("url") or "").strip())
+        if card_url:
+            candidates.append(card_url)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not _is_valid_http_url(candidate):
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        out.append(candidate)
+    return out
+
+
+def _is_valid_http_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _first_source_url(tool_data: dict[str, Any]) -> str:
+    page = tool_data.get("page")
+    if isinstance(page, dict):
+        candidate = _normalize_url(str(page.get("url") or "").strip())
+        if candidate and _is_valid_http_url(candidate):
+            return candidate
+
+    search = tool_data.get("search")
+    if isinstance(search, list):
+        for item in search:
+            if not isinstance(item, dict):
+                continue
+            candidate = _normalize_url(str(item.get("url") or "").strip())
+            if candidate and _is_valid_http_url(candidate):
+                return candidate
+    return ""
+
+
+def _has_url(text: str) -> bool:
+    return bool(URL_PATTERN.search(text or ""))
+
+
+def _needs_source_for_claim(text: str) -> bool:
+    candidate = text or ""
+    if not candidate:
+        return False
+    return bool(re.search(r"\b\d{1,4}(?:[.,]\d+)?%?\b", candidate))
+
+
+def _extract_bootstrap_url(persona: str) -> str:
+    direct = re.search(r"https?://[^\s)\]}]+", persona or "", flags=re.IGNORECASE)
+    if direct:
+        candidate = _normalize_url(direct.group(0).rstrip(".,);]"))
+        if candidate and _is_valid_http_url(candidate):
+            return candidate
+
+    arxiv_rss = re.search(
+        r"\brss\.arxiv\.org/rss/[A-Za-z0-9._-]+\b", persona or "", flags=re.IGNORECASE
+    )
+    if arxiv_rss:
+        candidate = f"https://{arxiv_rss.group(0)}"
+        if _is_valid_http_url(candidate):
+            return candidate
+
+    return ""
+
+
 def _extract_json(text: str) -> dict[str, Any]:
     text = text.strip()
     try:
@@ -61,6 +229,20 @@ def _extract_json(text: str) -> dict[str, Any]:
         return json.loads(m.group(0))
     except Exception:
         return {}
+
+
+def _normalize_decision_shape(decision: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(decision, dict):
+        return {}
+    tool_request = decision.get("tool_request")
+    if not isinstance(tool_request, dict):
+        return decision
+
+    merged = dict(decision)
+    for key in ("web_search_query", "web_fetch_url", "reason"):
+        if key not in merged and key in tool_request:
+            merged[key] = tool_request.get(key)
+    return merged
 
 
 def _build_system_prompt(
@@ -80,21 +262,26 @@ def _build_system_prompt(
         "You are an autonomous social agent on Mastodon. "
         "Be active and helpful, but concise and safe. "
         "You may choose multiple actions each cycle if useful, or noop when there is nothing new. "
-        "Prefer replying in active conversations when there is an interesting post to engage with. "
+        "Strongly prefer replying in active conversations when there is an interesting post to engage with. "
         "Before creating a brand-new post, check whether you can continue an existing thread by replying to the latest relevant reply. "
-        "Prioritize healthy back-and-forth with other agents and humans over starting too many standalone posts. "
+        "Prioritize healthy back-and-forth with other agents and humans over starting standalone posts. "
+        "If there are recent thread candidates, choose reply unless there is a clear reason to start a new post. "
         "If there are no fresh mentions and you still have posting quota, proactively create one original post from fresh evidence. "
         "If you posted recently, avoid posting again unless there is genuinely new value. "
         "Never post duplicate content: do not repost the same or similar news/fact/topic if others already posted it in the provided timeline context. "
+        "When creating a new root post, make it as diverse as possible from other recent posts in timeline and trends, while still matching your persona. "
         "Critically compare against your own recent posts and avoid posting the same or very similar content again. "
         "If your draft overlaps strongly with your own recent posts, switch to replying in-thread or pick a different topic. "
         "Avoid repeating your own recent themes; diversify topics over time when possible. "
+        "Do not invent facts, numbers, timelines, or citations; only use information you can support from provided context or fetched pages. "
         f"Keep every post/reply/dm within {post_char_limit} characters. "
         f"Current remaining daily quota is posts={remaining_quota.get('posts', 0)}, replies={remaining_quota.get('replies', 0)}, dms={remaining_quota.get('dms', 0)}. Plan actions accordingly. "
         "For factual/news posts, include at least one source URL when available so readers can verify context. "
         "Prefer concise posts that include one high-quality link over linkless summaries. "
         "Never output a truncated or broken URL. If needed, shorten prose and keep URLs complete; if a valid URL cannot fit, post without URL. "
+        "When replying in a thread, if the same source URL already appeared earlier in that thread, do not include the URL again. "
         "If a post is rejected for length, rewrite it shorter with the same core info. "
+        "You can also use favourite (star/like) or boost (reblog) to acknowledge strong posts/replies when you have no substantial new content to add. "
         "Only follow or DM when it is contextually meaningful. "
         "Never reply to answer a question in your own posts. Never target your own account in follow/dm. "
         "If you have already replied to someone who has not replied back, avoid replying to them again to prevent one-sided conversations. "
@@ -134,6 +321,7 @@ def _build_decision_prompt(
                 "in_reply_to_id": item.get("in_reply_to_id"),
                 "created_at": item.get("created_at"),
                 "content": _strip_html(str(item.get("content", "")))[:280],
+                "urls": _status_urls(item)[:4],
             }
         )
 
@@ -155,6 +343,7 @@ def _build_decision_prompt(
                 "text": _strip_html(str((n.get("status") or {}).get("content", "")))[
                     :220
                 ],
+                "urls": _status_urls(n.get("status") or {})[:4],
             }
         )
 
@@ -164,10 +353,12 @@ def _build_decision_prompt(
             "post_char_limit": post_char_limit,
             "remaining_quota": remaining_quota,
             "thread_reply_instruction": "When replying in a thread, prefer replying to the newest relevant reply id (last_reply_id) instead of the root post id.",
+            "reply_priority_instruction": "Prefer replying to `active_threads` and `thread_hints` before creating new root posts.",
             "schema": {
-                "action": "post|reply|follow|dm|noop",
+                "action": "post|reply|follow|dm|favourite|boost|noop",
                 "text": "required for post/reply/dm",
                 "in_reply_to_id": "required for reply",
+                "status_id": "required for favourite/boost",
                 "target_acct": "required for follow and dm, e.g. alice@example.social",
                 "web_search_query": "optional",
                 "web_fetch_url": "optional",
@@ -176,9 +367,10 @@ def _build_decision_prompt(
             "multi_action_schema": {
                 "actions": [
                     {
-                        "action": "post|reply|follow|dm|noop",
+                        "action": "post|reply|follow|dm|favourite|boost|noop",
                         "text": "optional",
                         "in_reply_to_id": "optional",
+                        "status_id": "optional",
                         "target_acct": "optional",
                         "reason": "optional",
                     }
@@ -188,6 +380,7 @@ def _build_decision_prompt(
             "timeline": sample_home,
             "notifications": sample_notifs,
             "thread_hints": thread_hints,
+            "active_threads": thread_hints[:12],
             "own_recent_posts": own_recent_posts,
         },
         ensure_ascii=True,
@@ -210,6 +403,7 @@ def _summarize_statuses(statuses: list[Any], self_id: str) -> list[dict[str, Any
                 "in_reply_to_id": item.get("in_reply_to_id"),
                 "created_at": item.get("created_at"),
                 "content": _strip_html(str(item.get("content", "")))[:280],
+                "urls": _status_urls(item)[:4],
             }
         )
     return out
@@ -367,14 +561,15 @@ def _parse_actions(decision: dict[str, Any]) -> list[dict[str, Any]]:
 def _has_action(decision: dict[str, Any]) -> bool:
     if not isinstance(decision, dict):
         return False
-    raw_action = decision.get("action")
-    if isinstance(raw_action, str) and raw_action.strip():
+    raw_action = _normalized_action(decision.get("action"))
+    if raw_action in ALLOWED_ACTIONS and raw_action != "noop":
         return True
     raw_actions = decision.get("actions")
     if isinstance(raw_actions, list):
         for item in raw_actions:
-            if isinstance(item, dict) and isinstance(item.get("action"), str):
-                if item.get("action", "").strip():
+            if isinstance(item, dict):
+                action = _normalized_action(item.get("action"))
+                if action in ALLOWED_ACTIONS and action != "noop":
                     return True
     return False
 
@@ -382,13 +577,13 @@ def _has_action(decision: dict[str, Any]) -> bool:
 def _is_noop_action(decision: dict[str, Any]) -> bool:
     if not isinstance(decision, dict):
         return False
-    action = str(decision.get("action") or "").strip().lower()
+    action = _normalized_action(decision.get("action"))
     if action == "noop":
         return True
     actions = decision.get("actions")
     if isinstance(actions, list) and actions:
         normalized = [
-            str(item.get("action") or "").strip().lower()
+            _normalized_action(item.get("action"))
             for item in actions
             if isinstance(item, dict)
         ]
@@ -624,10 +819,56 @@ def run_cycle(
     ]
 
     convo = list(messages)
-    decision = _extract_json(llm.chat(convo, temperature=llm_temperature))
+    decision = _normalize_decision_shape(
+        _extract_json(llm.chat(convo, temperature=llm_temperature))
+    )
 
     tool_data: dict[str, Any] = {}
     tool_rounds: list[dict[str, Any]] = []
+
+    if (
+        not decision.get("web_search_query")
+        and not decision.get("web_fetch_url")
+        and not _has_action(decision)
+    ):
+        bootstrap_url = _extract_bootstrap_url(persona)
+        if bootstrap_url:
+            bootstrap_requested = {"web_fetch_url": bootstrap_url, "bootstrap": True}
+            try:
+                tool_data["page"] = web.fetch_page_text(bootstrap_url)
+            except Exception as e:
+                tool_data["page_error"] = str(e)
+            bootstrap_result = {
+                k: tool_data[k] for k in ("page", "page_error") if k in tool_data
+            }
+            tool_rounds.append(
+                {"requested": bootstrap_requested, "result": bootstrap_result}
+            )
+            convo.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "content": json.dumps(decision, ensure_ascii=True),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "tool_data": bootstrap_result,
+                                "instruction": (
+                                    "You now have fetched source content from persona guidance. "
+                                    "Return final action JSON now (no further tools unless strictly needed)."
+                                ),
+                                "post_char_limit": post_char_limit,
+                            },
+                            ensure_ascii=True,
+                        ),
+                    },
+                ]
+            )
+            decision = _normalize_decision_shape(
+                _extract_json(llm.chat(convo, temperature=llm_temperature)) or decision
+            )
 
     for _ in range(3):
         requested_tools: dict[str, Any] = {}
@@ -686,7 +927,7 @@ def run_cycle(
             ]
         )
 
-        decision = (
+        decision = _normalize_decision_shape(
             _extract_json(llm.chat(convo, temperature=llm_temperature)) or decision
         )
 
@@ -712,9 +953,114 @@ def run_cycle(
                 },
             ]
         )
-        decision = (
+        decision = _normalize_decision_shape(
             _extract_json(llm.chat(convo, temperature=llm_temperature)) or decision
         )
+
+    if not _has_action(decision) and tool_data:
+        convo.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": json.dumps(decision, ensure_ascii=True),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "instruction": (
+                                "Return final action JSON now. Choose one action from post/reply/follow/dm/favourite/boost/noop. "
+                                "Do not request any more tools."
+                            ),
+                            "tool_data": {
+                                k: tool_data[k]
+                                for k in (
+                                    "search",
+                                    "page",
+                                    "search_error",
+                                    "page_error",
+                                )
+                                if k in tool_data
+                            },
+                            "post_char_limit": post_char_limit,
+                        },
+                        ensure_ascii=True,
+                    ),
+                },
+            ]
+        )
+        decision = _normalize_decision_shape(
+            _extract_json(llm.chat(convo, temperature=llm_temperature)) or decision
+        )
+
+    if not _has_action(decision):
+        repair_payload = {
+            "instruction": (
+                "Repair the prior output into strict final action JSON. "
+                "Return exactly one object with either `action` or `actions`. "
+                "Allowed actions: post/reply/follow/dm/favourite/boost/noop. "
+                "No tool requests."
+            ),
+            "prior_output": decision,
+            "post_char_limit": post_char_limit,
+            "remaining_quota": remaining_quota,
+            "tool_data": {
+                k: tool_data[k]
+                for k in ("search", "page", "search_error", "page_error")
+                if k in tool_data
+            },
+            "has_mention": first_mention is not None,
+        }
+        repair_messages = [
+            {
+                "role": "system",
+                "content": "You repair malformed planner outputs into valid final action JSON.",
+            },
+            {"role": "user", "content": json.dumps(repair_payload, ensure_ascii=True)},
+        ]
+        repaired = _normalize_decision_shape(
+            _extract_json(
+                llm.chat(repair_messages, temperature=min(llm_temperature, 0.25))
+            )
+        )
+        if _has_action(repaired) or _is_noop_action(repaired):
+            decision = repaired
+
+    if not _has_action(decision):
+        last_chance_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Return strict JSON only with either `action` or `actions`. "
+                    "Allowed actions: post, reply, follow, dm, favourite, boost, noop. "
+                    "No tool requests in this response."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "post_char_limit": post_char_limit,
+                        "remaining_quota": remaining_quota,
+                        "has_mention": first_mention is not None,
+                        "tool_data": {
+                            k: tool_data[k]
+                            for k in ("search", "page", "search_error", "page_error")
+                            if k in tool_data
+                        },
+                    },
+                    ensure_ascii=True,
+                ),
+            },
+        ]
+        last_chance = _normalize_decision_shape(
+            _extract_json(llm.chat(last_chance_messages, temperature=0.1))
+        )
+        if _has_action(last_chance) or _is_noop_action(last_chance):
+            decision = last_chance
+
+    if not _has_action(decision):
+        decision = {"action": "noop", "reason": "invalid_decision_shape"}
 
     if _is_noop_action(decision) and tool_rounds:
         has_search_results = (
@@ -754,7 +1100,7 @@ def run_cycle(
                     },
                 ]
             )
-            decision = (
+            decision = _normalize_decision_shape(
                 _extract_json(llm.chat(convo, temperature=llm_temperature)) or decision
             )
 
@@ -775,11 +1121,42 @@ def run_cycle(
     actions = _parse_actions(decision)
 
     executed: list[dict[str, Any]] = []
+    source_url = _first_source_url(tool_data)
+    thread_url_cache: dict[str, set[str]] = {}
 
     for action_obj in actions[: max(1, max_actions)]:
-        action = str(action_obj.get("action", "noop"))
+        action = _normalized_action(action_obj.get("action"))
 
-        url_pattern = re.compile(r"https?://\S+", flags=re.IGNORECASE)
+        def thread_seen_urls(status_id: str) -> set[str]:
+            sid = str(status_id or "").strip()
+            if not sid:
+                return set()
+            cached = thread_url_cache.get(sid)
+            if cached is not None:
+                return cached
+
+            seen_urls: set[str] = set()
+            try:
+                status = agent.status(sid)
+                for url in _status_urls(status):
+                    seen_urls.add(url)
+            except Exception:
+                pass
+
+            try:
+                ctx = agent.status_context(sid)
+                ancestors = ctx.get("ancestors") if isinstance(ctx, dict) else []
+                if isinstance(ancestors, list):
+                    for item in ancestors:
+                        if not isinstance(item, dict):
+                            continue
+                        for url in _status_urls(item):
+                            seen_urls.add(url)
+            except Exception:
+                pass
+
+            thread_url_cache[sid] = seen_urls
+            return seen_urls
 
         def shorten_text_preserve_urls(value: str, target: int) -> str:
             if len(value) <= target:
@@ -794,17 +1171,17 @@ def run_cycle(
                     return text[:target]
                 return text[: target - 1].rstrip() + "…"
 
-            urls = [m.group(0).strip() for m in url_pattern.finditer(value)]
+            urls = [m.group(0).strip() for m in URL_PATTERN.finditer(value)]
             if not urls:
                 return shorten_plain(value)
 
             first_url = urls[0]
             if len(first_url) > target:
-                no_url = url_pattern.sub("", value)
+                no_url = URL_PATTERN.sub("", value)
                 no_url = re.sub(r"\s+", " ", no_url).strip()
                 return shorten_plain(no_url)
 
-            prose = url_pattern.sub("", value)
+            prose = URL_PATTERN.sub("", value)
             prose = re.sub(r"\s+", " ", prose).strip()
             reserve = len(first_url) + (1 if prose else 0)
             available = target - reserve
@@ -830,6 +1207,22 @@ def run_cycle(
             soft = max(40, int(post_char_limit * 0.85))
             return shorten_text_preserve_urls(value, soft)
 
+        def apply_source_policy(
+            value: str, blocked_urls: set[str] | None = None
+        ) -> str:
+            candidate = _sanitize_text_urls(value)
+            blocked = blocked_urls or set()
+            if blocked and _has_url(candidate):
+                for match in URL_PATTERN.finditer(candidate):
+                    normalized = _normalize_url(match.group(0).strip().rstrip(".,);]"))
+                    if normalized in blocked:
+                        candidate = _sanitize_text_urls(URL_PATTERN.sub("", candidate))
+                        break
+            if _needs_source_for_claim(candidate) and not _has_url(candidate):
+                if source_url and source_url not in blocked:
+                    candidate = f"{candidate} {source_url}".strip()
+            return candidate
+
         def is_too_long_error(error: Exception) -> bool:
             if not isinstance(error, httpx.HTTPStatusError):
                 return False
@@ -839,7 +1232,7 @@ def run_cycle(
             return "too long" in body or "validation failed" in body and "text" in body
 
         if action == "post" and action_obj.get("text"):
-            candidate = fit_text(str(action_obj["text"]))
+            candidate = fit_text(apply_source_policy(str(action_obj["text"])))
             if not candidate:
                 executed.append(
                     {
@@ -881,7 +1274,10 @@ def run_cycle(
             and action_obj.get("in_reply_to_id")
         ):
             target_id = str(action_obj["in_reply_to_id"])
-            reply_text = fit_text(str(action_obj["text"]))
+            blocked_urls = thread_seen_urls(target_id)
+            reply_text = fit_text(
+                apply_source_policy(str(action_obj["text"]), blocked_urls=blocked_urls)
+            )
             if not reply_text:
                 executed.append(
                     {
@@ -920,6 +1316,40 @@ def run_cycle(
                 )
             continue
 
+        if action in {"favourite", "boost"}:
+            status_id = str(
+                action_obj.get("status_id")
+                or action_obj.get("in_reply_to_id")
+                or action_obj.get("id")
+                or ""
+            ).strip()
+            if not status_id:
+                executed.append(
+                    {
+                        "action": "noop",
+                        "reason": "missing status_id for engagement action",
+                    }
+                )
+                continue
+            try:
+                if action == "favourite":
+                    executed.append(
+                        {"action": "favourite", "result": agent.favourite(status_id)}
+                    )
+                else:
+                    executed.append(
+                        {"action": "boost", "result": agent.boost(status_id)}
+                    )
+            except Exception as error:
+                executed.append(
+                    {
+                        "action": "noop",
+                        "reason": f"{action} failed",
+                        "error": _api_error(error),
+                    }
+                )
+            continue
+
         if action == "follow" and action_obj.get("target_acct"):
             try:
                 executed.append(
@@ -939,7 +1369,7 @@ def run_cycle(
             continue
 
         if action == "dm" and action_obj.get("target_acct") and action_obj.get("text"):
-            dm_text = fit_text(str(action_obj["text"]))
+            dm_text = fit_text(apply_source_policy(str(action_obj["text"])))
             if not dm_text:
                 executed.append(
                     {

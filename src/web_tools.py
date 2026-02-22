@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import base64
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -34,6 +35,19 @@ def _normalize_search_url(raw_url: str) -> str:
         return unquote(query["uddg"][0])
     if "bing.com" in host and query.get("url"):
         return unquote(query["url"][0])
+    if "bing.com" in host and query.get("u"):
+        raw = query["u"][0]
+        if raw.startswith("a1"):
+            raw = raw[2:]
+        try:
+            pad = "=" * ((4 - len(raw) % 4) % 4)
+            decoded = base64.urlsafe_b64decode((raw + pad).encode("ascii")).decode(
+                "utf-8", "ignore"
+            )
+            if decoded.startswith("http://") or decoded.startswith("https://"):
+                return decoded
+        except Exception:
+            pass
 
     return url
 
@@ -190,28 +204,6 @@ class WebTools:
         except Exception:
             results = []
 
-        if results:
-            return results
-
-        url = f"https://www.bing.com/search?q={quote(query)}"
-        resp = self.http.get(url, follow_redirects=True)
-        resp.raise_for_status()
-        body = resp.text
-
-        matches = re.findall(
-            r'<li[^>]*class="[^"]*b_algo[^"]*"[^>]*>.*?<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-            body,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-
-        for href, title_html in matches[: max(1, min(limit, 10))]:
-            title = _strip_tags(title_html)
-            url = _normalize_search_url(href)
-            if not title:
-                continue
-            if not url:
-                continue
-            results.append({"engine": "bing", "title": title, "url": url})
         return results
 
     def _search_wikipedia(self, query: str, limit: int) -> list[dict[str, str]]:
