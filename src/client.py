@@ -15,6 +15,7 @@ class AgentClient:
 
     def __post_init__(self) -> None:
         self.base_url = self.base_url.rstrip("/")
+        self._max_post_chars_cache: int | None = None
         self._http = httpx.Client(
             base_url=self.base_url,
             verify=not self.allow_insecure_tls,
@@ -172,3 +173,23 @@ class AgentClient:
             f"/api/v1/accounts/search?q={quote(acct_query)}&resolve=true&limit={max(1, min(limit, 80))}",
         )
         return payload if isinstance(payload, list) else []
+
+    def max_post_characters(self) -> int:
+        if self._max_post_chars_cache is not None:
+            return self._max_post_chars_cache
+
+        limit = 500
+        try:
+            payload = self._json("GET", "/api/v2/instance")
+            conf = payload.get("configuration", {}) if isinstance(payload, dict) else {}
+            statuses = conf.get("statuses", {}) if isinstance(conf, dict) else {}
+            value = (
+                statuses.get("max_characters") if isinstance(statuses, dict) else None
+            )
+            if isinstance(value, int) and value > 0:
+                limit = value
+        except Exception:
+            pass
+
+        self._max_post_chars_cache = limit
+        return limit

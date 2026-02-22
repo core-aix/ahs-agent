@@ -6,6 +6,8 @@ import json
 import os
 import secrets
 import string
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,64 @@ def _random_password(length: int = 24) -> str:
     chars = string.ascii_letters + string.digits
     core = "".join(secrets.choice(chars) for _ in range(max(12, length - 2)))
     return f"A{core}!"
+
+
+def _is_unconfirmed_email_error(error: Exception) -> bool:
+    return "missing a confirmed e-mail address" in str(error).lower()
+
+
+def _pending_confirmation_payload() -> dict[str, str]:
+    return {
+        "status": "pending_email_confirmation",
+        "details": "Confirm the account email, then rerun token/connect to finish linking.",
+    }
+
+
+def _connect_with_confirmation_flow(
+    client: OnboardClient,
+    app: dict[str, str],
+    email: str,
+    password: str,
+    user_token: str,
+    scope: str,
+    interactive_wait: bool,
+) -> tuple[dict[str, Any], str]:
+    try:
+        return client.connect_agent(user_token), user_token
+    except RuntimeError as error:
+        if not _is_unconfirmed_email_error(error):
+            raise
+
+    if not interactive_wait:
+        return _pending_confirmation_payload(), user_token
+
+    print("Account email is not confirmed yet.")
+    print("Open the confirmation email and click the link.")
+
+    latest_token = user_token
+    while True:
+        answer = (
+            input(
+                "Press Enter to retry after confirming, or type 'later' to continue without linking: "
+            )
+            .strip()
+            .lower()
+        )
+        if answer in {"later", "l", "skip", "s"}:
+            return _pending_confirmation_payload(), latest_token
+        time.sleep(1)
+        try:
+            latest_token = client.password_grant_token(app, email, password, scope)
+        except RuntimeError as token_error:
+            print(f"Still cannot get user token: {token_error}")
+            continue
+        try:
+            return client.connect_agent(latest_token), latest_token
+        except RuntimeError as retry_error:
+            if _is_unconfirmed_email_error(retry_error):
+                print("Still unconfirmed. Confirm email first, then retry.")
+                continue
+            raise
 
 
 @dataclass
@@ -164,6 +224,11 @@ def _common(subparser: argparse.ArgumentParser) -> None:
         "--registry-file",
         default=os.getenv("AGENT_REGISTRY_FILE", ".agent-registry.json"),
     )
+    subparser.add_argument(
+        "--no-wait-for-confirmation",
+        action="store_true",
+        help="Do not wait interactively for email confirmation before linking",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -188,6 +253,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_token.add_argument("--agent", help="Agent username from local registry")
     p_token.add_argument("--email")
     p_token.add_argument("--password")
+    p_token.add_argument("--save-agent", help="Save email/password under this username")
     p_token.add_argument("--scope", default="read write follow")
     p_token.add_argument("--skip-connect", action="store_true")
 
@@ -218,6 +284,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_llm.add_argument(
         "--ollama-model", default=os.getenv("OLLAMA_MODEL", "gpt-oss:120b")
+    )
+    p_llm.add_argument(
+        "--ollama-max-tokens",
+        type=int,
+        default=int(os.getenv("OLLAMA_MAX_TOKENS", "2048")),
     )
     p_llm.add_argument("--ollama-api-key", default=os.getenv("OLLAMA_API_KEY", ""))
     p_llm.add_argument("--skip-connect", action="store_true")
@@ -255,6 +326,7 @@ def main() -> None:
 
     try:
         app = client.ensure_app()
+        interactive_wait = (not args.no_wait_for_confirmation) and sys.stdin.isatty()
 
         if args.command == "register":
             if args.email:
@@ -268,8 +340,18 @@ def main() -> None:
             app_token = client.app_token(app, "write:accounts")
             created = client.register_account(app_token, args.username, email, password)
             user_token = str(created["access_token"])
-            connected = None if args.skip_connect else client.connect_agent(user_token)
             registry.add_agent(args.username, email, password)
+            connected = None
+            if not args.skip_connect:
+                connected, user_token = _connect_with_confirmation_flow(
+                    client,
+                    app,
+                    email,
+                    password,
+                    user_token,
+                    args.scope,
+                    interactive_wait,
+                )
 
             print(
                 json.dumps(
@@ -297,7 +379,19 @@ def main() -> None:
             app_token = client.app_token(app, "write:accounts")
             created = client.register_account(app_token, args.username, email, password)
             user_token = str(created["access_token"])
-            connected = None if args.skip_connect else client.connect_agent(user_token)
+            registry.add_agent(args.username, email, password)
+
+            connected = None
+            if not args.skip_connect:
+                connected, user_token = _connect_with_confirmation_flow(
+                    client,
+                    app,
+                    email,
+                    password,
+                    user_token,
+                    "read write follow",
+                    interactive_wait,
+                )
 
             persona = (args.persona or "").strip() or _prompt_persona()
             if not persona:
@@ -311,7 +405,6 @@ def main() -> None:
                 if not ollama_api_key:
                     raise SystemExit("Ollama Cloud API key is required for cloud mode")
 
-            registry.add_agent(args.username, email, password)
             registry.set_persona(args.username, persona)
             registry.set_llm_config(
                 args.username,
@@ -320,6 +413,7 @@ def main() -> None:
                     "base_url": args.ollama_base_url,
                     "model": args.ollama_model,
                     "api_key": ollama_api_key,
+                    "max_tokens": int(args.ollama_max_tokens),
                 },
             )
 
@@ -336,6 +430,7 @@ def main() -> None:
                             "mode": args.ollama_mode,
                             "base_url": args.ollama_base_url,
                             "model": args.ollama_model,
+                            "max_tokens": int(args.ollama_max_tokens),
                             "api_key_set": bool(ollama_api_key),
                         },
                     },
@@ -351,11 +446,13 @@ def main() -> None:
             if args.agent:
                 record = registry.get_agent(args.agent)
                 if not record:
-                    raise SystemExit(
-                        f"Agent '{args.agent}' not found in local registry"
-                    )
-                email = str(record.get("email") or "")
-                password = str(record.get("password") or "")
+                    if not email or not password:
+                        raise SystemExit(
+                            f"Agent '{args.agent}' not found in local registry. Use --email/--password once, optionally with --save-agent {args.agent}."
+                        )
+                else:
+                    email = str(record.get("email") or "")
+                    password = str(record.get("password") or "")
 
             if not email:
                 raise SystemExit("Provide --email or --agent")
@@ -364,8 +461,21 @@ def main() -> None:
                     "Provide --password or use --agent with stored password"
                 )
 
+            if args.save_agent:
+                registry.add_agent(args.save_agent, email, password)
+
             user_token = client.password_grant_token(app, email, password, args.scope)
-            connected = None if args.skip_connect else client.connect_agent(user_token)
+            connected = None
+            if not args.skip_connect:
+                connected, user_token = _connect_with_confirmation_flow(
+                    client,
+                    app,
+                    email,
+                    password,
+                    user_token,
+                    args.scope,
+                    interactive_wait,
+                )
             print(
                 json.dumps(
                     {

@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
 from dotenv import load_dotenv
 
 from agent_cli import OnboardClient
@@ -64,7 +65,7 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 
 def _build_system_prompt(
-    persona: str, self_id: str, self_acct: str, has_mentions: bool
+    persona: str, self_id: str, self_acct: str, has_mentions: bool, post_char_limit: int
 ) -> str:
     mention_rule = (
         "You have fresh mention notifications. Prioritize replying to mentions first. "
@@ -72,24 +73,33 @@ def _build_system_prompt(
         else ""
     )
     return (
-        "You are an autonomous social AI agent on Mastodon. "
+        "You are an autonomous social agent on Mastodon. "
         "Be active and helpful, but concise and safe. "
         "You may choose multiple actions each cycle if useful, or noop when there is nothing new. "
         "Prefer reply when there is an interesting post to engage with. "
         "If you posted recently, avoid posting again unless there is genuinely new value. "
+        "Never post duplicate content: do not repost the same news/fact/topic if others already posted it in the provided timeline context. "
+        f"Keep every post/reply/dm within {post_char_limit} characters. "
+        "If a post is rejected for length, rewrite it shorter with the same core info. "
         "Only follow or DM when it is contextually meaningful. "
-        "Never reply to your own posts. Never target your own account in follow/dm. "
+        "Never reply to answer a question in your own posts. Never target your own account in follow/dm. "
+        "If you have already replied to someone who has not replied back, avoid replying to them again to prevent one-sided conversations. "
+        "Never reply to the same mention more than once. NEVER post or reply about the same news/fact/topic more than once. "
         "You may request web_search_query and web_fetch_url to gather context before deciding. "
         "If you need up-to-date or uncertain factual information, do not speculate: immediately request web_search_query first, then decide from evidence. "
         f"{mention_rule}"
         "Return strict JSON only.\n\n"
         f"Your identity: account_id={self_id}, acct={self_acct}\n"
-        f"Persona and interests:\n{persona.strip()}"
+        f"Your persona and interests:\n{persona.strip()}"
     )
 
 
 def _build_decision_prompt(
-    home: list[Any], notifications: list[Any], self_id: str, self_acct: str
+    home: list[Any],
+    notifications: list[Any],
+    self_id: str,
+    self_acct: str,
+    post_char_limit: int,
 ) -> str:
     sample_home = []
     for item in home[:40]:
@@ -126,6 +136,7 @@ def _build_decision_prompt(
     return json.dumps(
         {
             "task": "Choose one action for this cycle.",
+            "post_char_limit": post_char_limit,
             "schema": {
                 "action": "post|reply|follow|dm|noop",
                 "text": "required for post/reply/dm",
@@ -201,6 +212,38 @@ def _parse_actions(decision: dict[str, Any]) -> list[dict[str, Any]]:
         if actions:
             return actions
     return [decision]
+
+
+def _has_action(decision: dict[str, Any]) -> bool:
+    if not isinstance(decision, dict):
+        return False
+    raw_action = decision.get("action")
+    if isinstance(raw_action, str) and raw_action.strip():
+        return True
+    raw_actions = decision.get("actions")
+    if isinstance(raw_actions, list):
+        for item in raw_actions:
+            if isinstance(item, dict) and isinstance(item.get("action"), str):
+                if item.get("action", "").strip():
+                    return True
+    return False
+
+
+def _is_noop_action(decision: dict[str, Any]) -> bool:
+    if not isinstance(decision, dict):
+        return False
+    action = str(decision.get("action") or "").strip().lower()
+    if action == "noop":
+        return True
+    actions = decision.get("actions")
+    if isinstance(actions, list) and actions:
+        normalized = [
+            str(item.get("action") or "").strip().lower()
+            for item in actions
+            if isinstance(item, dict)
+        ]
+        return bool(normalized) and all(a in {"", "noop"} for a in normalized)
+    return False
 
 
 def _recent_self_post_exists(
@@ -323,6 +366,30 @@ def _select_topic_posts(
     return selected
 
 
+def _api_error(error: Exception) -> dict[str, Any]:
+    if isinstance(error, httpx.HTTPStatusError):
+        response = error.response
+        detail = response.text[:400] if response is not None else str(error)
+        payload: dict[str, Any] = {
+            "type": "http_status_error",
+            "status": response.status_code if response is not None else None,
+            "detail": detail,
+        }
+        if response is not None and response.headers.get("retry-after"):
+            payload["retry_after"] = response.headers.get("retry-after")
+        return payload
+    if isinstance(error, httpx.HTTPError):
+        return {"type": "http_error", "detail": str(error)}
+    return {"type": "error", "detail": str(error)}
+
+
+def _safe_agent_status(agent: AgentClient) -> dict[str, Any]:
+    try:
+        return agent.agent_status()
+    except Exception as error:
+        return {"status_error": _api_error(error)}
+
+
 def run_cycle(
     agent: AgentClient,
     llm: OllamaClient,
@@ -332,13 +399,37 @@ def run_cycle(
     max_actions: int,
     post_cooldown_minutes: int,
 ) -> dict[str, Any]:
-    me = agent.verify_credentials()
+    try:
+        me = agent.verify_credentials()
+    except Exception as error:
+        return {
+            "decision": {"actions": [{"action": "noop", "reason": "api unavailable"}]},
+            "error": _api_error(error),
+            "status": _safe_agent_status(agent),
+        }
+
     self_id = str(me.get("id") or "")
     self_acct = str(me.get("acct") or me.get("username") or "")
+    post_char_limit = agent.max_post_characters()
 
-    home = agent.read_home(limit=20)
-    notifications = agent.mention_notifications_all(page_limit=80)
-    trends = agent.trends_statuses(limit=40)
+    try:
+        home = agent.read_home(limit=20)
+        notifications = agent.mention_notifications_all(page_limit=80)
+        trends = agent.trends_statuses(limit=40)
+    except Exception as error:
+        reason = (
+            "rate limited"
+            if isinstance(error, httpx.HTTPStatusError)
+            and error.response.status_code == 429
+            else "read failed"
+        )
+        return {
+            "decision": {"actions": [{"action": "noop", "reason": reason}]},
+            "error": _api_error(error),
+            "read_scope": {"mentions": 0, "home": 0, "topic_posts": 0},
+            "status": _safe_agent_status(agent),
+        }
+
     topic_posts = _select_topic_posts(
         trends, persona, self_id, min_count=10, max_count=20
     )
@@ -349,42 +440,144 @@ def run_cycle(
         {
             "role": "system",
             "content": _build_system_prompt(
-                persona, self_id, self_acct, first_mention is not None
+                persona, self_id, self_acct, first_mention is not None, post_char_limit
             ),
         },
         {
             "role": "user",
             "content": _build_decision_prompt(
-                prompt_home, notifications, self_id, self_acct
+                prompt_home, notifications, self_id, self_acct, post_char_limit
             ),
         },
     ]
 
-    initial = llm.chat(messages)
-    decision = _extract_json(initial)
+    convo = list(messages)
+    decision = _extract_json(llm.chat(convo))
 
     tool_data: dict[str, Any] = {}
-    if decision.get("web_search_query"):
-        try:
-            tool_data["search"] = web.keyword_search(str(decision["web_search_query"]))
-        except Exception as e:
-            tool_data["search_error"] = str(e)
+    tool_rounds: list[dict[str, Any]] = []
 
-    if decision.get("web_fetch_url"):
-        try:
-            tool_data["page"] = web.fetch_page_text(str(decision["web_fetch_url"]))
-        except Exception as e:
-            tool_data["page_error"] = str(e)
+    for _ in range(3):
+        requested_tools: dict[str, Any] = {}
+        if decision.get("web_search_query"):
+            requested_tools["web_search_query"] = str(decision["web_search_query"])
+            try:
+                tool_data["search"] = web.keyword_search(
+                    requested_tools["web_search_query"]
+                )
+            except Exception as e:
+                tool_data["search_error"] = str(e)
 
-    if tool_data:
-        followup_messages = messages + [
-            {"role": "assistant", "content": json.dumps(decision, ensure_ascii=True)},
+        if decision.get("web_fetch_url"):
+            requested_tools["web_fetch_url"] = str(decision["web_fetch_url"])
+            try:
+                tool_data["page"] = web.fetch_page_text(
+                    requested_tools["web_fetch_url"]
+                )
+            except Exception as e:
+                tool_data["page_error"] = str(e)
+
+        if not requested_tools:
+            break
+
+        tool_rounds.append(
             {
-                "role": "user",
-                "content": json.dumps({"tool_data": tool_data}, ensure_ascii=True),
-            },
-        ]
-        decision = _extract_json(llm.chat(followup_messages)) or decision
+                "requested": requested_tools,
+                "result": {
+                    k: tool_data[k]
+                    for k in ("search", "search_error", "page", "page_error")
+                    if k in tool_data
+                },
+            }
+        )
+
+        convo.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": json.dumps(decision, ensure_ascii=True),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "tool_data": tool_rounds[-1]["result"],
+                            "instruction": (
+                                "Use this tool output. If still needed, you may request another tool once. "
+                                "Otherwise return final action JSON now."
+                            ),
+                            "post_char_limit": post_char_limit,
+                        },
+                        ensure_ascii=True,
+                    ),
+                },
+            ]
+        )
+
+        decision = _extract_json(llm.chat(convo)) or decision
+
+    if not _has_action(decision):
+        convo.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": json.dumps(decision, ensure_ascii=True),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "instruction": (
+                                "Now return action JSON only. Include `action` or `actions`. "
+                                "Do not request more tools in this response."
+                            ),
+                            "post_char_limit": post_char_limit,
+                        },
+                        ensure_ascii=True,
+                    ),
+                },
+            ]
+        )
+        decision = _extract_json(llm.chat(convo)) or decision
+
+    if _is_noop_action(decision) and tool_rounds:
+        has_search_results = (
+            isinstance(tool_data.get("search"), list)
+            and len(tool_data.get("search", [])) > 0
+        )
+        if has_search_results:
+            convo.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "content": json.dumps(decision, ensure_ascii=True),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "instruction": (
+                                    "You already have search evidence. Produce a concrete action now (prefer post or reply), "
+                                    "not noop, unless all sources are unusable."
+                                ),
+                                "post_char_limit": post_char_limit,
+                                "tool_data": {
+                                    k: tool_data[k]
+                                    for k in (
+                                        "search",
+                                        "page",
+                                        "search_error",
+                                        "page_error",
+                                    )
+                                    if k in tool_data
+                                },
+                            },
+                            ensure_ascii=True,
+                        ),
+                    },
+                ]
+            )
+            decision = _extract_json(llm.chat(convo)) or decision
 
     result: dict[str, Any] = {
         "decision": decision,
@@ -395,6 +588,8 @@ def run_cycle(
             "topic_posts": len(topic_posts),
         },
     }
+    if tool_rounds:
+        result["tool_data_rounds"] = tool_rounds
 
     status_by_id: dict[str, dict[str, Any]] = {}
     for item in home:
@@ -422,15 +617,62 @@ def run_cycle(
     for action_obj in actions[: max(1, max_actions)]:
         action = str(action_obj.get("action", "noop"))
 
+        def fit_text(value: str) -> str:
+            if len(value) <= post_char_limit:
+                return value
+            if post_char_limit <= 1:
+                return value[:post_char_limit]
+            return value[: post_char_limit - 1].rstrip() + "…"
+
+        def shrink_more(value: str) -> str:
+            soft = max(40, int(post_char_limit * 0.85))
+            if len(value) <= soft:
+                return value
+            if soft <= 1:
+                return value[:soft]
+            return value[: soft - 1].rstrip() + "…"
+
+        def is_too_long_error(error: Exception) -> bool:
+            if not isinstance(error, httpx.HTTPStatusError):
+                return False
+            body = (
+                error.response.text if error.response is not None else str(error)
+            ).lower()
+            return "too long" in body or "validation failed" in body and "text" in body
+
         if action == "post" and action_obj.get("text"):
             if recent_post:
                 executed.append(
                     {"action": "noop", "reason": "recent self post cooldown"}
                 )
                 continue
-            executed.append(
-                {"action": "post", "result": agent.post(str(action_obj["text"]))}
-            )
+            candidate = fit_text(str(action_obj["text"]))
+            try:
+                executed.append({"action": "post", "result": agent.post(candidate)})
+            except Exception as error:
+                if is_too_long_error(error):
+                    shorter = shrink_more(candidate)
+                    if shorter != candidate:
+                        try:
+                            executed.append(
+                                {
+                                    "action": "post",
+                                    "result": agent.post(shorter),
+                                    "note": "retried with shorter text",
+                                }
+                            )
+                            recent_post = True
+                            continue
+                        except Exception as retry_error:
+                            error = retry_error
+                executed.append(
+                    {
+                        "action": "noop",
+                        "reason": "post failed",
+                        "error": _api_error(error),
+                    }
+                )
+                continue
             recent_post = True
             continue
 
@@ -447,14 +689,35 @@ def run_cycle(
             if self_id and target_author_id == self_id:
                 executed.append({"action": "noop", "reason": "blocked self-reply"})
                 continue
-            executed.append(
-                {
-                    "action": "reply",
-                    "result": agent.post(
-                        str(action_obj["text"]), in_reply_to_id=target_id
-                    ),
-                }
-            )
+            reply_text = fit_text(str(action_obj["text"]))
+            try:
+                executed.append(
+                    {
+                        "action": "reply",
+                        "result": agent.post(reply_text, in_reply_to_id=target_id),
+                    }
+                )
+            except Exception as error:
+                if is_too_long_error(error):
+                    shorter = shrink_more(reply_text)
+                    try:
+                        executed.append(
+                            {
+                                "action": "reply",
+                                "result": agent.post(shorter, in_reply_to_id=target_id),
+                                "note": "retried with shorter text",
+                            }
+                        )
+                        continue
+                    except Exception as retry_error:
+                        error = retry_error
+                executed.append(
+                    {
+                        "action": "noop",
+                        "reason": "reply failed",
+                        "error": _api_error(error),
+                    }
+                )
             continue
 
         if action == "follow" and action_obj.get("target_acct"):
@@ -462,12 +725,21 @@ def run_cycle(
             if target == self_acct.lstrip("@"):
                 executed.append({"action": "noop", "reason": "blocked self-follow"})
                 continue
-            executed.append(
-                {
-                    "action": "follow",
-                    "result": agent.follow(str(action_obj["target_acct"])),
-                }
-            )
+            try:
+                executed.append(
+                    {
+                        "action": "follow",
+                        "result": agent.follow(str(action_obj["target_acct"])),
+                    }
+                )
+            except Exception as error:
+                executed.append(
+                    {
+                        "action": "noop",
+                        "reason": "follow failed",
+                        "error": _api_error(error),
+                    }
+                )
             continue
 
         if action == "dm" and action_obj.get("target_acct") and action_obj.get("text"):
@@ -475,14 +747,37 @@ def run_cycle(
             if target == self_acct.lstrip("@"):
                 executed.append({"action": "noop", "reason": "blocked self-dm"})
                 continue
-            executed.append(
-                {
-                    "action": "dm",
-                    "result": agent.dm(
-                        str(action_obj["target_acct"]), str(action_obj["text"])
-                    ),
-                }
-            )
+            dm_text = fit_text(str(action_obj["text"]))
+            try:
+                executed.append(
+                    {
+                        "action": "dm",
+                        "result": agent.dm(str(action_obj["target_acct"]), dm_text),
+                    }
+                )
+            except Exception as error:
+                if is_too_long_error(error):
+                    shorter = shrink_more(dm_text)
+                    try:
+                        executed.append(
+                            {
+                                "action": "dm",
+                                "result": agent.dm(
+                                    str(action_obj["target_acct"]), shorter
+                                ),
+                                "note": "retried with shorter text",
+                            }
+                        )
+                        continue
+                    except Exception as retry_error:
+                        error = retry_error
+                executed.append(
+                    {
+                        "action": "noop",
+                        "reason": "dm failed",
+                        "error": _api_error(error),
+                    }
+                )
             continue
 
         executed.append(
@@ -493,8 +788,9 @@ def run_cycle(
         )
 
     result["execution"] = executed
+    result["post_char_limit"] = post_char_limit
 
-    result["status"] = agent.agent_status()
+    result["status"] = _safe_agent_status(agent)
     return result
 
 
@@ -542,6 +838,11 @@ def main() -> None:
         or ("http://127.0.0.1:11434" if mode == "local" else "https://ollama.com")
     )
     api_key = str(llm_cfg.get("api_key") or os.getenv("OLLAMA_API_KEY", ""))
+    max_tokens_raw = llm_cfg.get("max_tokens") or os.getenv("OLLAMA_MAX_TOKENS", "2048")
+    try:
+        max_tokens = int(str(max_tokens_raw))
+    except Exception:
+        max_tokens = 2048
 
     agent = AgentClient(
         base_url=args.base_url, token=token, allow_insecure_tls=allow_insecure_tls
@@ -551,20 +852,29 @@ def main() -> None:
         model=model,
         base_url=base,
         api_key=api_key,
+        max_output_tokens=max_tokens,
         allow_insecure_tls=allow_insecure_tls,
     )
     web = WebTools(allow_insecure_tls=allow_insecure_tls)
 
     try:
         while True:
-            payload = run_cycle(
-                agent,
-                llm,
-                web,
-                persona,
-                max_actions=args.max_actions,
-                post_cooldown_minutes=args.post_cooldown_minutes,
-            )
+            try:
+                payload = run_cycle(
+                    agent,
+                    llm,
+                    web,
+                    persona,
+                    max_actions=args.max_actions,
+                    post_cooldown_minutes=args.post_cooldown_minutes,
+                )
+            except Exception as error:
+                payload = {
+                    "decision": {
+                        "actions": [{"action": "noop", "reason": "cycle failed"}]
+                    },
+                    "error": _api_error(error),
+                }
             print(json.dumps(payload, indent=2))
             if args.once:
                 break
