@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="Random jitter (+/- seconds) applied to interval sleeps",
     )
-    parser.add_argument("--max-actions", type=int, default=3)
+    parser.add_argument("--max-actions", type=int, default=6)
     parser.add_argument("--post-cooldown-minutes", type=int, default=30)
     parser.add_argument("--allow-insecure-tls", action="store_true")
     return parser.parse_args()
@@ -271,6 +271,7 @@ def _build_system_prompt(
         "You are an autonomous social agent on Mastodon. "
         "Be active and helpful, but concise and safe. "
         "You may choose multiple actions each cycle if useful, or noop when there is nothing new. "
+        "Within one cycle, you may do multiple replies/favourites/boosts when meaningful, but at most one new root post. "
         "Strongly prefer replying in active conversations when there is an interesting post to engage with. "
         "Before creating a brand-new post, check whether you can continue an existing thread by replying to the latest relevant reply. "
         f"Today's date is {today_utc} (UTC). Focus on the most recent available information and prefer fresh updates over old news. "
@@ -377,9 +378,10 @@ def _build_decision_prompt(
 
     return json.dumps(
         {
-            "task": "Choose one action for this cycle.",
+            "task": "Choose one or more actions for this cycle.",
             "post_char_limit": post_char_limit,
             "remaining_quota": remaining_quota,
+            "action_limit_rule": "Multiple replies/favourites/boosts are allowed when useful, but include at most one `post` action.",
             "thread_reply_instruction": "When replying in a thread, prefer replying to the newest relevant reply id (last_reply_id) instead of the root post id.",
             "reply_priority_instruction": "Prefer replying to `active_threads` and `thread_hints` before creating new root posts.",
             "schema": {
@@ -1168,13 +1170,31 @@ def run_cycle(
     if tool_rounds:
         result["tool_data_rounds"] = tool_rounds
 
-    actions = _parse_actions(decision)
+    raw_actions = _parse_actions(decision)
+    actions: list[dict[str, Any]] = []
+    post_seen = False
+    for item in raw_actions:
+        if not isinstance(item, dict):
+            continue
+        normalized = _normalized_action(item.get("action"))
+        if normalized == "post":
+            if post_seen:
+                continue
+            post_seen = True
+        normalized_item = dict(item)
+        normalized_item["action"] = normalized
+        actions.append(normalized_item)
+        if len(actions) >= max(1, max_actions):
+            break
+
+    if not actions:
+        actions = [{"action": "noop", "reason": "no valid actions"}]
 
     executed: list[dict[str, Any]] = []
     source_url = _first_source_url(tool_data)
     thread_url_cache: dict[str, set[str]] = {}
 
-    for action_obj in actions[: max(1, max_actions)]:
+    for action_obj in actions:
         action = _normalized_action(action_obj.get("action"))
 
         def thread_seen_urls(status_id: str) -> set[str]:
@@ -1281,8 +1301,37 @@ def run_cycle(
             ).lower()
             return "too long" in body or "validation failed" in body and "text" in body
 
+        def invalid_urls_from_error(error: Exception) -> set[str]:
+            if not isinstance(error, httpx.HTTPStatusError) or error.response is None:
+                return set()
+            if error.response.status_code != 422:
+                return set()
+            try:
+                payload = error.response.json()
+            except Exception:
+                return set()
+            if not isinstance(payload, dict):
+                return set()
+            if str(payload.get("error") or "") != "invalid_urls":
+                return set()
+
+            details = payload.get("details")
+            if not isinstance(details, dict):
+                return set()
+            raw = details.get("invalidUrls")
+            if not isinstance(raw, list):
+                return set()
+
+            out: set[str] = set()
+            for item in raw:
+                normalized = _normalize_url(str(item or "").strip())
+                if normalized:
+                    out.add(normalized)
+            return out
+
         if action == "post" and action_obj.get("text"):
-            candidate = fit_text(apply_source_policy(str(action_obj["text"])))
+            original_text = str(action_obj["text"])
+            candidate = fit_text(apply_source_policy(original_text))
             if not candidate:
                 executed.append(
                     {
@@ -1308,6 +1357,23 @@ def run_cycle(
                             continue
                         except Exception as retry_error:
                             error = retry_error
+                invalid_urls = invalid_urls_from_error(error)
+                if invalid_urls:
+                    repaired = fit_text(
+                        apply_source_policy(original_text, blocked_urls=invalid_urls)
+                    )
+                    if repaired and repaired != candidate:
+                        try:
+                            executed.append(
+                                {
+                                    "action": "post",
+                                    "result": agent.post(repaired),
+                                    "note": "retried after removing invalid URL(s)",
+                                }
+                            )
+                            continue
+                        except Exception as retry_error:
+                            error = retry_error
                 executed.append(
                     {
                         "action": "noop",
@@ -1324,9 +1390,10 @@ def run_cycle(
             and action_obj.get("in_reply_to_id")
         ):
             target_id = str(action_obj["in_reply_to_id"])
+            original_text = str(action_obj["text"])
             blocked_urls = thread_seen_urls(target_id)
             reply_text = fit_text(
-                apply_source_policy(str(action_obj["text"]), blocked_urls=blocked_urls)
+                apply_source_policy(original_text, blocked_urls=blocked_urls)
             )
             if not reply_text:
                 executed.append(
@@ -1357,6 +1424,28 @@ def run_cycle(
                         continue
                     except Exception as retry_error:
                         error = retry_error
+                invalid_urls = invalid_urls_from_error(error)
+                if invalid_urls:
+                    repaired = fit_text(
+                        apply_source_policy(
+                            original_text,
+                            blocked_urls=blocked_urls.union(invalid_urls),
+                        )
+                    )
+                    if repaired and repaired != reply_text:
+                        try:
+                            executed.append(
+                                {
+                                    "action": "reply",
+                                    "result": agent.post(
+                                        repaired, in_reply_to_id=target_id
+                                    ),
+                                    "note": "retried after removing invalid URL(s)",
+                                }
+                            )
+                            continue
+                        except Exception as retry_error:
+                            error = retry_error
                 executed.append(
                     {
                         "action": "noop",
@@ -1419,7 +1508,8 @@ def run_cycle(
             continue
 
         if action == "dm" and action_obj.get("target_acct") and action_obj.get("text"):
-            dm_text = fit_text(apply_source_policy(str(action_obj["text"])))
+            original_text = str(action_obj["text"])
+            dm_text = fit_text(apply_source_policy(original_text))
             if not dm_text:
                 executed.append(
                     {
@@ -1451,6 +1541,25 @@ def run_cycle(
                         continue
                     except Exception as retry_error:
                         error = retry_error
+                invalid_urls = invalid_urls_from_error(error)
+                if invalid_urls:
+                    repaired = fit_text(
+                        apply_source_policy(original_text, blocked_urls=invalid_urls)
+                    )
+                    if repaired and repaired != dm_text:
+                        try:
+                            executed.append(
+                                {
+                                    "action": "dm",
+                                    "result": agent.dm(
+                                        str(action_obj["target_acct"]), repaired
+                                    ),
+                                    "note": "retried after removing invalid URL(s)",
+                                }
+                            )
+                            continue
+                        except Exception as retry_error:
+                            error = retry_error
                 executed.append(
                     {
                         "action": "noop",
